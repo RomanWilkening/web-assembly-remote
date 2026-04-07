@@ -1,0 +1,146 @@
+name: Build & Release (Windows)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 1. Build the WASM client (runs on Ubuntu for speed) ────────
+  build-wasm:
+    name: Build WASM Client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: wasm-${{ runner.os }}-
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked || true
+
+      - name: Build WASM client
+        working-directory: client
+        run: wasm-pack build --target web --release
+
+      - name: Prepare static assets
+        run: |
+          mkdir -p static/pkg
+          cp -r client/web/* static/
+          cp client/pkg/*.js   static/pkg/
+          cp client/pkg/*.wasm static/pkg/
+          cp client/pkg/*.d.ts static/pkg/ 2>/dev/null || true
+
+      - name: Upload static assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-assets
+          path: static/
+          retention-days: 1
+
+  # ── 2. Build the Windows server binary ─────────────────────────
+  build-server:
+    name: Build Windows Server
+    needs: build-wasm
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: server-windows-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: server-windows-
+
+      - name: Build server (release)
+        run: cargo build --release -p wasm-remote-server
+
+      - name: Download static assets
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: static-assets
+          path: static/
+
+      - name: Package release ZIP
+        shell: pwsh
+        run: |
+          $out = "wasm-remote-desktop"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item "target/release/wasm-remote-server.exe" "$out/"
+          Copy-Item -Recurse "static" "$out/static"
+
+          # Include a launcher script
+          @"
+          @echo off
+          echo Starting WebAssembly Remote Desktop Server...
+          echo.
+          echo Make sure FFmpeg is installed and in your PATH.
+          echo The server will listen on http://localhost:9090
+          echo.
+          wasm-remote-server.exe --encoder h264_amf --static-dir static
+          pause
+          "@ | Out-File -Encoding ascii "$out/start.bat"
+
+          Compress-Archive -Path "$out/*" -DestinationPath "wasm-remote-desktop-windows-x64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-remote-desktop-windows-x64
+          path: wasm-remote-desktop-windows-x64.zip
+          retention-days: 30
+
+  # ── 3. Run protocol tests ──────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run protocol tests
+        run: cargo test -p protocol
+
+  # ── 4. Create GitHub Release on tag push ───────────────────────
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-server, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: wasm-remote-desktop-windows-x64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wasm-remote-desktop-windows-x64.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
