@@ -16,7 +16,7 @@ impl ScreenCapture {
         let w = display.width() as u32;
         let h = display.height() as u32;
         let capturer = Capturer::new(display)?;
-        log::info!("Screen capture initialised: {}×{}", w, h);
+        log::info!("Screen capture initialized: {}×{}", w, h);
         Ok(Self { capturer, width: w, height: h })
     }
 

@@ -144,7 +144,7 @@ fn capture_loop(
     let mut frame_no: u64 = 0;
 
     loop {
-        let target = boot + frame_interval * frame_no as u32;
+        let target = boot + frame_interval.mul_f64(frame_no as f64);
         let now = Instant::now();
         if now < target {
             std::thread::sleep(target - now);

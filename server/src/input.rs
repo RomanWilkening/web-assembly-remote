@@ -36,7 +36,7 @@ impl InputSimulator {
         let screen_w = unsafe { winapi::um::winuser::GetSystemMetrics(0) } as u32;
         let screen_h = unsafe { winapi::um::winuser::GetSystemMetrics(1) } as u32;
 
-        // Normalise to 0‥65535 range required by absolute mouse input.
+        // Normalize to 0‥65535 range required by absolute mouse input.
         let norm_x = ((x as u32) * 65535 / screen_w.max(1)) as i32;
         let norm_y = ((y as u32) * 65535 / screen_h.max(1)) as i32;
 

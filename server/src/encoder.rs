@@ -77,7 +77,7 @@ impl FfmpegEncoder {
         }
 
         // ── common output flags ────────────────────────────────
-        let gop = (fps * 2).to_string(); // key-frame every 2 s
+        let gop = (fps * 2).to_string(); // key-frame every 2 seconds
         cmd.args([
             "-bf", "0",               // no B-frames
             "-g", &gop,
