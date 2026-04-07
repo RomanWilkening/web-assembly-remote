@@ -1,0 +1,7 @@
+/target
+**/target
+Cargo.lock
+client/pkg/
+server/static/pkg/
+*.wasm
+*.d
