@@ -1,0 +1,6 @@
+/target
+**/target
+client/pkg/
+server/static/pkg/
+*.wasm
+*.d

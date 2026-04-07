@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote Desktop</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Status overlay -->
+  <div id="overlay">
+    <p id="status">Connecting…</p>
+    <p id="latency"></p>
+  </div>
+
+  <!-- Remote desktop canvas (receives decoded video frames) -->
+  <canvas id="screen" tabindex="0"></canvas>
+
+  <!-- Load WASM glue then application code -->
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
