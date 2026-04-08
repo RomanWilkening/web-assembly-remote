@@ -1,7 +1,7 @@
 use crate::config::AuthConfig;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{FromRequest, State},
     http::{header, Request, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
@@ -142,15 +142,20 @@ pub struct LoginForm {
 /// Handle login form submission.
 pub async fn login_handler(
     State(auth): State<AuthState>,
-    Form(form): Form<LoginForm>,
+    req: Request<Body>,
 ) -> Response {
+    // Extract form data manually so we can also inspect request headers.
+    let is_https = is_request_secure(&req);
+    let form = match axum::Form::<LoginForm>::from_request(req, &()).await {
+        Ok(Form(f)) => f,
+        Err(_) => {
+            return Html(include_str!("../static_auth/login_failed.html")).into_response();
+        }
+    };
+
     match auth.login(&form.username, &form.password) {
         Some(token) => {
-            // Set session cookie (HttpOnly, SameSite=Strict, Secure for HTTPS).
-            let cookie = format!(
-                "session={}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=86400",
-                token
-            );
+            let cookie = build_session_cookie(&token, 86400, is_https);
             (
                 StatusCode::SEE_OTHER,
                 [
@@ -172,17 +177,54 @@ pub async fn logout_handler(
     State(auth): State<AuthState>,
     req: Request<Body>,
 ) -> Response {
+    let is_https = is_request_secure(&req);
     if let Some(token) = extract_session_token(&req) {
         auth.logout(&token);
     }
 
-    let cookie = "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
+    let cookie = build_session_cookie("", 0, is_https);
     (
         StatusCode::SEE_OTHER,
         [
-            (header::SET_COOKIE, cookie.to_string()),
+            (header::SET_COOKIE, cookie),
             (header::LOCATION, "/login".to_string()),
         ],
     )
         .into_response()
+}
+
+// --- Cookie helpers ---
+
+/// Build a session cookie string.
+/// The `Secure` flag is only set when the request arrived over HTTPS
+/// (directly or via a reverse proxy such as Apache with `X-Forwarded-Proto`).
+/// `SameSite=Lax` is used instead of `Strict` so that the cookie survives
+/// the POST → 303 redirect after login, even when an SSL-inspecting proxy
+/// (e.g. Netskope) is in the path.
+fn build_session_cookie(token: &str, max_age: u64, secure: bool) -> String {
+    let mut cookie = format!(
+        "session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        token, max_age
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Detect whether the original client request was made over HTTPS.
+/// Checks the `X-Forwarded-Proto` header (set by reverse proxies like Apache)
+/// first, then falls back to the request URI scheme.
+fn is_request_secure(req: &Request<Body>) -> bool {
+    // Check reverse-proxy header first (Apache: `RequestHeader set X-Forwarded-Proto "https"`)
+    if let Some(proto) = req.headers().get("x-forwarded-proto") {
+        if let Ok(s) = proto.to_str() {
+            return s.eq_ignore_ascii_case("https");
+        }
+    }
+    // Fall back to the request URI scheme.
+    req.uri()
+        .scheme_str()
+        .map(|s| s.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
 }
