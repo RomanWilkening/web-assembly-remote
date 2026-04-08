@@ -6,16 +6,23 @@
 username = "admin"
 password = "changeme"
 
-# Audio capture device name (optional).
-# Leave commented out or empty to disable audio streaming.
+# Audio output device for loopback capture (optional).
 #
-# On Windows, use the name of a DirectShow audio device.
-# Run 'ffmpeg -list_devices true -f dshow -i dummy' to list available devices.
+# Available audio output devices are auto-discovered and listed in the
+# browser toolbar.  The user can select which output device to capture.
+#
+# Set this to auto-start capturing a specific device when a client
+# connects.  Use "default" to capture the system default output.
+# Leave commented out to let the user choose manually.
+#
+# On Windows this uses WASAPI loopback – no "Stereo Mix" or virtual
+# audio cable required.  Any audio playing through the selected
+# output device is streamed to the browser automatically.
+#
+# On Linux this uses PulseAudio (monitor sources capture output audio).
+#
 # Examples:
-#   audio_device = "Stereo Mix (Realtek High Definition Audio)"
-#   audio_device = "CABLE Output (VB-Audio Virtual Cable)"
-#
-# On Linux, use a PulseAudio source name:
 #   audio_device = "default"
+#   audio_device = "Speakers (Realtek High Definition Audio)"
 #
 # audio_device = ""
