@@ -15,6 +15,7 @@ use tower_http::services::ServeDir;
 use crate::capture::ScreenCapture;
 use crate::encoder::{EncodedFrame, FfmpegEncoder};
 use crate::input::InputSimulator;
+use scrap::Display;
 
 pub struct ServerConfig {
     pub addr: SocketAddr,
@@ -63,6 +64,36 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     log::info!("WebSocket client connected");
 
     let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // ── 0. Query display dimensions and send ServerInfo ────────
+    let screen_dims = tokio::task::spawn_blocking(|| {
+        let display = Display::primary().map_err(|e| e.to_string())?;
+        Ok::<_, String>((display.width() as u16, display.height() as u16))
+    })
+    .await;
+
+    let (screen_w, screen_h) = match screen_dims {
+        Ok(Ok(dims)) => dims,
+        Ok(Err(e)) => {
+            log::error!("Failed to query display: {e}");
+            return;
+        }
+        Err(e) => {
+            log::error!("Task join error: {e}");
+            return;
+        }
+    };
+
+    let info_msg = protocol::ServerMessage::ServerInfo {
+        width: screen_w,
+        height: screen_h,
+        fps: state.fps as u8,
+    };
+    log::info!("Sending ServerInfo: {}×{} @ {} fps", screen_w, screen_h, state.fps);
+    if ws_tx.send(Message::Binary(info_msg.encode().into())).await.is_err() {
+        log::error!("Failed to send ServerInfo – client disconnected");
+        return;
+    }
 
     // Channel: encoder → WebSocket sender (small buffer to avoid latency).
     let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(2);
@@ -135,7 +166,7 @@ fn capture_loop(
     let w = capture.width();
     let h = capture.height();
 
-    log::info!("Sending ServerInfo: {}×{} @ {} fps", w, h, fps);
+    log::info!("Capture initialized: {}×{} @ {} fps", w, h, fps);
 
     let mut encoder = FfmpegEncoder::new(w, h, fps, quality, encoder_name, frame_tx)?;
 
