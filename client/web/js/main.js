@@ -243,7 +243,7 @@ async function main() {
       statusEl.textContent = 'Connected – waiting for first frame…';
       // If a specific monitor was requested, send SelectMonitor
       // Otherwise, send ClientReady.
-      if (monitorIndex !== undefined && monitorIndex > 0) {
+      if (monitorIndex !== undefined) {
         send(wasm.encode_select_monitor(monitorIndex));
       } else {
         send(wasm.encode_client_ready());

@@ -60,11 +60,28 @@ browser's WebCodecs API (also hardware-accelerated) and renders on a `<canvas>`.
 .\build.ps1 -Release
 ```
 
-### 2. Run the server
+### 2. Configure
+
+Copy and edit the configuration file:
+
+```powershell
+copy config.toml.example config.toml
+# Edit config.toml to set your username and password
+```
+
+**config.toml** format:
+
+```toml
+[auth]
+username = "admin"
+password = "your-secure-password"
+```
+
+### 3. Run the server
 
 ```powershell
 cd server
-.\target\debug\wasm-remote-server.exe --encoder h264_amf --fps 60 --quality 20
+.\target\debug\wasm-remote-server.exe --config ..\config.toml --encoder h264_amf --fps 60 --quality 20
 ```
 
 CLI flags:
@@ -77,10 +94,41 @@ CLI flags:
 | `--quality` | `20` | H.264 QP value (lower = better quality, higher bitrate) |
 | `--encoder` | `h264_amf` | FFmpeg encoder name (`h264_amf`, `libx264`, …) |
 | `--static-dir` | `./static` | Path to client web files |
+| `--config` | `config.toml` | Path to TOML configuration file |
 
-### 3. Open in browser
+### 4. Open in browser
 
-Navigate to `http://localhost:9090`.  Click the canvas to focus it for keyboard input.
+Navigate to `http://localhost:9090`. You will be prompted to log in with the credentials from `config.toml`.
+
+## Features
+
+### Authentication
+- Login page with credentials from `config.toml`
+- Session-based authentication (HttpOnly cookies)
+- All routes protected, including WebSocket
+
+### UI Controls (press Escape to toggle toolbar)
+- **Fullscreen**: Toggle with toolbar button or F11
+- **Start/Stop Stream**: Connect/disconnect the video stream
+- **Scale**: Choose from Fit, 100%, 75%, 50%
+- **Monitor Selector**: Switch between monitors on multi-monitor setups
+- **Mouse Lock**: Lock the mouse cursor to the canvas (toggle with Ctrl+Alt+M)
+- **Logout**: End the session
+
+### Multi-Monitor Support
+- Server enumerates all connected monitors
+- Client shows a dropdown to select which monitor to view
+- Switching monitors reconnects the stream
+
+### Pointer Lock (Mouse Lock-In)
+- Press **Ctrl+Alt+M** or click the toolbar button to lock/unlock the mouse
+- When locked, the mouse cursor is confined to the remote desktop area
+- A visual indicator shows when pointer lock is active
+
+### Remote Cursor
+- Server captures the cursor position from the remote machine
+- A cursor overlay is rendered in the browser, tracking the remote cursor
+- Works even when the local cursor is hidden
 
 ## Apache Reverse Proxy
 
@@ -124,24 +172,29 @@ a2enmod proxy proxy_http proxy_wstunnel rewrite ssl headers
 ├── protocol/          Shared binary protocol (Rust crate)
 │   └── src/lib.rs
 ├── server/            Desktop capture + encoding server (Windows)
+│   ├── static_auth/       Login page HTML (embedded at compile time)
 │   └── src/
 │       ├── main.rs        CLI entry point
-│       ├── server.rs      HTTP + WebSocket (axum)
-│       ├── capture.rs     Screen capture (scrap / DXGI)
+│       ├── server.rs      HTTP + WebSocket (axum) + auth middleware
+│       ├── config.rs      TOML configuration loader
+│       ├── auth.rs        Session-based authentication
+│       ├── capture.rs     Screen capture (scrap / DXGI) + multi-monitor
+│       ├── cursor.rs      Cursor position capture (Win32 GetCursorInfo)
 │       ├── encoder.rs     FFmpeg AMF pipeline + H.264 parser
 │       └── input.rs       Mouse / keyboard simulation (SendInput)
 ├── client/            WASM protocol module + web UI
 │   ├── src/lib.rs         Protocol encode/decode + latency tracker
 │   └── web/
-│       ├── index.html
-│       ├── style.css
+│       ├── index.html     Main UI with toolbar, cursor overlay
+│       ├── style.css      Styles for toolbar, cursor, lock indicator
 │       └── js/
-│           ├── main.js       App bootstrap, WebSocket orchestration
-│           ├── decoder.js    WebCodecs H.264 decoder (Annex-B → AVC)
+│           ├── main.js       App bootstrap, WebSocket, toolbar controls
+│           ├── decoder.js    WebCodecs H.264 decoder (Annex-B mode)
 │           ├── renderer.js   Canvas renderer (newest-frame policy)
-│           └── input.js      Keyboard/mouse → VK code mapping
-├── build.ps1          Windows build script (PowerShell)
-├── build.sh           Linux/macOS build script (CPU fallback)
+│           └── input.js      Keyboard/mouse → VK code + pointer lock
+├── config.toml.example    Sample configuration file
+├── build.ps1              Windows build script (PowerShell)
+├── build.sh               Linux/macOS build script (CPU fallback)
 └── readme.md
 ```
 

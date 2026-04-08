@@ -4,3 +4,4 @@ client/pkg/
 server/static/pkg/
 *.wasm
 *.d
+config.toml

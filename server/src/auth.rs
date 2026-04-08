@@ -43,8 +43,10 @@ impl AuthState {
         let u_hash = Self::hash_str(username);
         let p_hash = Self::hash_str(password);
 
-        // Constant-time comparison via hash comparison.
-        if u_hash != self.username_hash || p_hash != self.password_hash {
+        // Constant-time comparison: always compare both to avoid timing leaks.
+        let u_ok = u_hash == self.username_hash;
+        let p_ok = p_hash == self.password_hash;
+        if !(u_ok & p_ok) {
             return None;
         }
 
@@ -144,9 +146,9 @@ pub async fn login_handler(
 ) -> Response {
     match auth.login(&form.username, &form.password) {
         Some(token) => {
-            // Set session cookie (HttpOnly, SameSite=Strict, Secure in production).
+            // Set session cookie (HttpOnly, SameSite=Strict, Secure for HTTPS).
             let cookie = format!(
-                "session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
+                "session={}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=86400",
                 token
             );
             (

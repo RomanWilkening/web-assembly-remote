@@ -10,10 +10,8 @@ pub fn get_cursor_position() -> (u16, u16, bool) {
     use winapi::shared::windef::POINT;
     use winapi::um::winuser::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
-    let mut ci = CURSORINFO {
-        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
-        ..unsafe { std::mem::zeroed() }
-    };
+    let mut ci: CURSORINFO = unsafe { std::mem::zeroed() };
+    ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
 
     let ok = unsafe { GetCursorInfo(&mut ci) };
     if ok == 0 {
