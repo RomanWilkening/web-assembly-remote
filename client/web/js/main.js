@@ -109,6 +109,7 @@ async function main() {
         const fps = wasm.server_info_fps(data);
         console.log(`ServerInfo: ${w}×${h} @ ${fps} fps`);
         renderer.resize(w, h);
+        decoder.setRemoteSize(w, h);
 
         if (!inputHandler) {
           inputHandler = new InputHandler(canvas, wasm, send, w, h);

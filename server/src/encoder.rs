@@ -56,7 +56,6 @@ impl FfmpegEncoder {
                     "-qp_i", &qp,
                     "-qp_p", &qp,
                     "-profile:v", "main",
-                    "-level", "4.1",
                 ]);
             }
             "libx264" => {

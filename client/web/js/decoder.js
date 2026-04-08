@@ -1,8 +1,10 @@
 /**
  * WebCodecs-based H.264 decoder for ultra-low-latency video.
  *
- * Receives Annex-B access units and converts them to AVC format
- * for the browser's hardware-accelerated VideoDecoder.
+ * Receives Annex-B access units and passes them directly to the
+ * browser's hardware-accelerated VideoDecoder in Annex-B mode
+ * (no avcC description). This is the most compatible approach
+ * and avoids complex Annex-B → AVC conversion.
  */
 
 /**
@@ -20,36 +22,57 @@ export class H264Decoder {
     /** @private */
     this._configured = false;
     /** @private */
-    this._sps = null;
+    this._codedWidth = 0;
     /** @private */
-    this._pps = null;
+    this._codedHeight = 0;
+    /** @private */
+    this._useSoftware = false;
+  }
+
+  /**
+   * Set the remote desktop dimensions for the decoder configuration.
+   * Must be called before the first decode() call (typically from
+   * ServerInfo).
+   * @param {number} width
+   * @param {number} height
+   */
+  setRemoteSize(width, height) {
+    this._codedWidth = width;
+    this._codedHeight = height;
   }
 
   /**
    * Configure the decoder once the first key-frame arrives.
-   * SPS + PPS are extracted from the Annex-B data to build the
-   * avcC description required by WebCodecs.
+   * SPS is extracted from the Annex-B data to build the codec
+   * string. No avcC description is provided – Chrome will decode
+   * the raw Annex-B data directly.
    * @param {Uint8Array} annexB – complete key-frame access unit
    */
   _configureFromKeyFrame(annexB) {
     const nalUnits = parseAnnexB(annexB);
 
+    let sps = null;
     for (const nal of nalUnits) {
-      const type_ = nal[0] & 0x1f;
-      if (type_ === 7) this._sps = nal; // SPS
-      if (type_ === 8) this._pps = nal; // PPS
+      if (nal.length > 3 && (nal[0] & 0x1f) === 7) {
+        sps = nal;
+        break;
+      }
     }
 
-    if (!this._sps || !this._pps) {
-      console.warn('Key-frame missing SPS/PPS – cannot configure decoder');
+    if (!sps) {
+      console.warn('Key-frame missing SPS – cannot configure decoder');
       return;
     }
 
-    const description = buildAvcC(this._sps, this._pps);
-    const profile = this._sps[1];
-    const compat = this._sps[2];
-    const level = this._sps[3];
+    const profile = sps[1];
+    const compat = sps[2];
+    const level = sps[3];
     const codec = `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
+
+    // Close any previous decoder instance.
+    if (this._decoder && this._decoder.state !== 'closed') {
+      try { this._decoder.close(); } catch (_) { /* ignore */ }
+    }
 
     this._decoder = new VideoDecoder({
       output: (frame) => this._onFrame(frame),
@@ -58,21 +81,42 @@ export class H264Decoder {
         // Mark as unconfigured so the next key-frame triggers
         // re-initialisation instead of feeding a closed decoder.
         this._configured = false;
+        // If hardware decoding failed, try software next time.
+        if (!this._useSoftware) {
+          console.warn('Retrying with software decoding on next key-frame');
+          this._useSoftware = true;
+        }
       },
     });
 
-    this._decoder.configure({
+    /** @type {VideoDecoderConfig} */
+    const config = {
       codec,
-      description,
       optimizeForLatency: true,
-    });
+    };
 
+    // Provide explicit dimensions if known (improves compatibility).
+    if (this._codedWidth > 0 && this._codedHeight > 0) {
+      config.codedWidth = this._codedWidth;
+      config.codedHeight = this._codedHeight;
+    }
+
+    // After a hardware-decode failure, fall back to software.
+    if (this._useSoftware) {
+      config.hardwareAcceleration = 'prefer-software';
+    }
+
+    this._decoder.configure(config);
     this._configured = true;
-    console.log(`Decoder configured: ${codec}`);
+
+    const accel = this._useSoftware ? ' (software)' : '';
+    console.log(`Decoder configured: ${codec}${accel}`);
   }
 
   /**
    * Decode one H.264 access unit (Annex-B).
+   * The raw Annex-B data (with start codes and inline SPS/PPS)
+   * is passed directly to WebCodecs.
    * @param {Uint8Array} annexB
    * @param {boolean} isKeyFrame
    * @param {number} timestampUs – microsecond timestamp from server
@@ -90,15 +134,13 @@ export class H264Decoder {
       if (!this._configured) return;
     }
 
-    // Convert Annex-B → AVC (length-prefixed NAL units),
-    // stripping parameter sets (SPS/PPS) since they are already
-    // provided via the avcC description during configure().
-    const avcData = annexBToAvc(annexB, /* stripParamSets */ true);
-
+    // Pass raw Annex-B data directly – no conversion needed.
+    // Chrome decodes Annex-B natively when no avcC description
+    // was provided during configure().
     const chunk = new EncodedVideoChunk({
       type: isKeyFrame ? 'key' : 'delta',
       timestamp: timestampUs, // µs
-      data: avcData,
+      data: annexB,
     });
 
     try {
@@ -171,76 +213,6 @@ function parseAnnexB(data) {
   }
 
   return nals;
-}
-
-/**
- * Convert Annex-B data to AVC format (4-byte big-endian length prefix
- * per NAL unit, start codes removed).
- *
- * @param {Uint8Array} annexB
- * @param {boolean} [stripParamSets=false] – When true, SPS (7) and
- *   PPS (8) NALs are omitted because they are already provided via
- *   the avcC description record.
- * @returns {Uint8Array}
- */
-function annexBToAvc(annexB, stripParamSets = false) {
-  const nals = parseAnnexB(annexB);
-
-  /** Should this NAL type be excluded from the output? */
-  const skip = (nalType) => {
-    if (nalType === 9) return true; // AUD – not needed by decoder
-    if (stripParamSets && (nalType === 7 || nalType === 8)) return true;
-    return false;
-  };
-
-  let totalSize = 0;
-  for (const nal of nals) {
-    if (nal.length === 0) continue;
-    if (skip(nal[0] & 0x1f)) continue;
-    totalSize += 4 + nal.length;
-  }
-
-  const out = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const nal of nals) {
-    if (nal.length === 0) continue;
-    if (skip(nal[0] & 0x1f)) continue;
-    // 4-byte big-endian length
-    out[offset]     = (nal.length >>> 24) & 0xff;
-    out[offset + 1] = (nal.length >>> 16) & 0xff;
-    out[offset + 2] = (nal.length >>> 8) & 0xff;
-    out[offset + 3] =  nal.length & 0xff;
-    out.set(nal, offset + 4);
-    offset += 4 + nal.length;
-  }
-
-  return out;
-}
-
-/**
- * Build an avcC (AVC Decoder Configuration Record) from SPS and PPS.
- * @param {Uint8Array} sps
- * @param {Uint8Array} pps
- * @returns {Uint8Array}
- */
-function buildAvcC(sps, pps) {
-  const len = 6 + 2 + sps.length + 1 + 2 + pps.length;
-  const buf = new Uint8Array(len);
-  let i = 0;
-  buf[i++] = 1;           // configurationVersion
-  buf[i++] = sps[1];      // AVCProfileIndication
-  buf[i++] = sps[2];      // profile_compatibility
-  buf[i++] = sps[3];      // AVCLevelIndication
-  buf[i++] = 0xff;        // lengthSizeMinusOne = 3  →  4-byte lengths
-  buf[i++] = 0xe1;        // numOfSequenceParameterSets = 1
-  buf[i++] = (sps.length >> 8) & 0xff;
-  buf[i++] = sps.length & 0xff;
-  buf.set(sps, i); i += sps.length;
-  buf[i++] = 1;           // numOfPictureParameterSets
-  buf[i++] = (pps.length >> 8) & 0xff;
-  buf[i++] = pps.length & 0xff;
-  buf.set(pps, i);
-  return buf;
 }
 
 /** @param {number} n @returns {string} */
