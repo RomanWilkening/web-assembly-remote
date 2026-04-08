@@ -116,6 +116,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .await
         .unwrap_or_default();
 
+    // Limit to 255 devices (u8 count in the protocol).
+    let audio_devices = if audio_devices.len() > 255 {
+        log::warn!(
+            "Found {} audio devices, limiting to 255 in the protocol",
+            audio_devices.len()
+        );
+        audio_devices[..255].to_vec()
+    } else {
+        audio_devices
+    };
+
     let audio_device_list: Vec<protocol::AudioDeviceInfo> = audio_devices
         .iter()
         .enumerate()

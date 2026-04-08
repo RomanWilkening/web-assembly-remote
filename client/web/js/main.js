@@ -306,7 +306,8 @@ async function main() {
       audioPlayer.setMuted(true);
       btnMute.textContent = '🔇 Unmute';
     } else {
-      const idx = parseInt(val);
+      const idx = parseInt(val, 10);
+      if (isNaN(idx)) return;
       send(wasm.encode_select_audio(idx));
       // Auto-unmute and re-initialise audio when a device is selected.
       audioPlayer.init().then(() => {

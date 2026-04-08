@@ -41,7 +41,10 @@ fn enumerate_audio_devices_dshow() -> Vec<String> {
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            log::warn!("Failed to run FFmpeg for audio device enumeration: {e}");
+            log::warn!(
+                "Failed to run FFmpeg for audio device enumeration \
+                 (ensure FFmpeg is installed and in PATH): {e}"
+            );
             return Vec::new();
         }
     };
@@ -124,7 +127,10 @@ fn enumerate_audio_devices_pulse() -> Vec<String> {
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            log::warn!("Failed to run FFmpeg for audio device enumeration: {e}");
+            log::warn!(
+                "Failed to run FFmpeg for audio device enumeration \
+                 (ensure FFmpeg is installed and in PATH): {e}"
+            );
             return Vec::new();
         }
     };
