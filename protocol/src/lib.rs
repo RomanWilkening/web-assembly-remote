@@ -10,6 +10,7 @@ pub const MSG_VIDEO_FRAME: u8 = 0x01;
 pub const MSG_SERVER_INFO: u8 = 0x02;
 pub const MSG_CURSOR_INFO: u8 = 0x03;
 pub const MSG_MONITOR_LIST: u8 = 0x04;
+pub const MSG_AUDIO_DATA: u8 = 0x05;
 
 // Client → Server
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -66,6 +67,10 @@ pub enum ServerMessage {
     /// List of available monitors.
     MonitorList {
         monitors: Vec<MonitorInfo>,
+    },
+    /// Raw audio data (f32le interleaved stereo at 48 kHz).
+    AudioData {
+        data: Vec<u8>,
     },
 }
 
@@ -125,6 +130,12 @@ impl ServerMessage {
                     buf.extend_from_slice(&m.height.to_le_bytes());
                     buf.push(u8::from(m.primary));
                 }
+                buf
+            }
+            ServerMessage::AudioData { data } => {
+                let mut buf = Vec::with_capacity(1 + data.len());
+                buf.push(MSG_AUDIO_DATA);
+                buf.extend_from_slice(data);
                 buf
             }
         }
@@ -222,6 +233,9 @@ impl ServerMessage {
                     monitors.push(MonitorInfo { index, x, y, width, height, primary });
                 }
                 Some(ServerMessage::MonitorList { monitors })
+            }
+            MSG_AUDIO_DATA if data.len() >= 2 => {
+                Some(ServerMessage::AudioData { data: data[1..].to_vec() })
             }
             _ => None,
         }
@@ -390,6 +404,21 @@ mod tests {
         let decoded = ClientMessage::decode(&encoded).unwrap();
         match decoded {
             ClientMessage::SelectMonitor { index } => assert_eq!(index, 2),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_audio_data() {
+        let pcm = vec![0u8; 7680]; // 20ms of 48kHz stereo f32le
+        let msg = ServerMessage::AudioData { data: pcm.clone() };
+        let encoded = msg.encode();
+        let decoded = ServerMessage::decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::AudioData { data } => {
+                assert_eq!(data.len(), 7680);
+                assert_eq!(data, pcm);
+            }
             _ => panic!("wrong variant"),
         }
     }

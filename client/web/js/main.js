@@ -10,12 +10,14 @@
 import { H264Decoder } from './decoder.js';
 import { Renderer }     from './renderer.js';
 import { InputHandler }  from './input.js';
+import { AudioPlayer }   from './audio.js';
 
 // Message-type constants (must match protocol crate).
 const MSG_VIDEO_FRAME  = 0x01;
 const MSG_SERVER_INFO  = 0x02;
 const MSG_CURSOR_INFO  = 0x03;
 const MSG_MONITOR_LIST = 0x04;
+const MSG_AUDIO_DATA   = 0x05;
 
 // ---------------------------------------------------------------------------
 // WASM loading with explicit fetch, timeout, and retry.
@@ -98,6 +100,7 @@ async function main() {
   const btnFullscreen   = document.getElementById('btn-fullscreen');
   const btnPointerLock  = document.getElementById('btn-pointerlock');
   const btnStream       = document.getElementById('btn-stream');
+  const btnMute         = document.getElementById('btn-mute');
   const btnLogout       = document.getElementById('btn-logout');
   const remoteCursor    = document.getElementById('remote-cursor');
   const lockIndicator   = document.getElementById('lock-indicator');
@@ -146,10 +149,14 @@ async function main() {
     return;
   }
 
-  // ── 3. Set up decoder + renderer ─────────────────────────────
+  // ── 3. Set up decoder + renderer + audio ──────────────────────
   const renderer = new Renderer(canvas);
   const decoder  = new H264Decoder((frame) => renderer.drawFrame(frame));
   const latencyTracker = new wasm.LatencyTracker(120);
+  const audioPlayer = new AudioPlayer();
+
+  // Initialise audio eagerly (loads the AudioWorklet processor).
+  audioPlayer.init().catch((e) => console.warn('Audio init deferred:', e));
 
   /** @type {InputHandler|null} */
   let inputHandler = null;
@@ -261,6 +268,7 @@ async function main() {
     }
     decoder.close();
     renderer.stop();
+    audioPlayer.close();
     statusEl.textContent = 'Stream stopped';
     btnStream.textContent = '▶ Start';
   }
@@ -268,8 +276,17 @@ async function main() {
   function startStream(monitorIndex) {
     streaming = true;
     btnStream.textContent = '⏹ Stop';
+    // Re-initialise audio player for the new connection.
+    audioPlayer.init().catch((e) => console.warn('Audio re-init deferred:', e));
     connect(monitorIndex);
   }
+
+  // ── 8b. Mute / unmute toggle ────────────────────────────────
+  btnMute.addEventListener('click', () => {
+    const willMute = !audioPlayer.muted;
+    audioPlayer.setMuted(willMute);
+    btnMute.textContent = willMute ? '🔇 Unmute' : '🔊 Mute';
+  });
 
   // ── 9. Monitor selector ──────────────────────────────────────
   monitorSelect.addEventListener('change', () => {
@@ -416,6 +433,13 @@ async function main() {
           const cy = wasm.cursor_info_y(data);
           const cv = wasm.cursor_info_visible(data);
           updateRemoteCursor(cx, cy, cv);
+          break;
+        }
+
+        case MSG_AUDIO_DATA: {
+          // Skip the 1-byte message type; rest is raw f32le PCM.
+          const pcmBytes = data.subarray(1);
+          audioPlayer.feed(pcmBytes);
           break;
         }
 

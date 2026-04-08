@@ -5,3 +5,17 @@
 # Change these values before deploying!
 username = "admin"
 password = "changeme"
+
+# Audio capture device name (optional).
+# Leave commented out or empty to disable audio streaming.
+#
+# On Windows, use the name of a DirectShow audio device.
+# Run 'ffmpeg -list_devices true -f dshow -i dummy' to list available devices.
+# Examples:
+#   audio_device = "Stereo Mix (Realtek High Definition Audio)"
+#   audio_device = "CABLE Output (VB-Audio Virtual Cable)"
+#
+# On Linux, use a PulseAudio source name:
+#   audio_device = "default"
+#
+# audio_device = ""
