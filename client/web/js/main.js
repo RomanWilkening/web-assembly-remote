@@ -112,6 +112,8 @@ async function main() {
   let pointerLocked = false;
   let remoteW = 0;
   let remoteH = 0;
+  /** Currently active monitor index (tracks what the server is capturing). */
+  let currentMonitorIndex = 0;
   /** @type {WebSocket|null} */
   let ws = null;
 
@@ -285,9 +287,12 @@ async function main() {
   function startStream(monitorIndex) {
     streaming = true;
     btnStream.textContent = '⏹ Stop';
+    if (monitorIndex !== undefined) {
+      currentMonitorIndex = monitorIndex;
+    }
     // Re-initialise audio player for the new connection.
     audioPlayer.init().catch((e) => console.warn('Audio re-init deferred:', e));
-    connect(monitorIndex);
+    connect();
   }
 
   // ── 8b. Mute / unmute toggle ────────────────────────────────
@@ -353,7 +358,7 @@ async function main() {
   }
 
   // ── 12. WebSocket connect ────────────────────────────────────
-  function connect(monitorIndex) {
+  function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${proto}://${location.host}/ws`;
     statusEl.textContent = `Connecting to ${wsUrl}…`;
@@ -363,13 +368,8 @@ async function main() {
 
     ws.addEventListener('open', () => {
       statusEl.textContent = 'Connected – waiting for first frame…';
-      // If a specific monitor was requested, send SelectMonitor
-      // Otherwise, send ClientReady.
-      if (monitorIndex !== undefined) {
-        send(wasm.encode_select_monitor(monitorIndex));
-      } else {
-        send(wasm.encode_client_ready());
-      }
+      // Always tell the server which monitor to capture.
+      send(wasm.encode_select_monitor(currentMonitorIndex));
     });
 
     ws.addEventListener('close', () => {
@@ -407,6 +407,17 @@ async function main() {
             opt.value    = idx.toString();
             opt.textContent = `Monitor ${idx}${prim ? ' (Primary)' : ''} – ${mw}×${mh}`;
             monitorSelect.appendChild(opt);
+          }
+
+          // Restore dropdown selection to the currently active monitor so the
+          // UI stays in sync after a reconnect.  If the monitor is no longer
+          // available (e.g. it was disconnected), fall back to the first entry.
+          const wantedValue = currentMonitorIndex.toString();
+          if ([...monitorSelect.options].some(o => o.value === wantedValue)) {
+            monitorSelect.value = wantedValue;
+          } else if (monitorSelect.options.length > 0) {
+            monitorSelect.value = monitorSelect.options[0].value;
+            currentMonitorIndex = parseInt(monitorSelect.value, 10);
           }
           break;
         }
