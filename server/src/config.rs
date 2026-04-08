@@ -6,10 +6,11 @@ use std::path::Path;
 pub struct AppConfig {
     /// Authentication settings.
     pub auth: AuthConfig,
-    /// Optional audio capture device name.
-    /// On Windows this is a DirectShow device name (e.g. "Stereo Mix (Realtek …)").
+    /// Optional audio output device name for loopback capture.
+    /// On Windows this is a WASAPI render endpoint name (e.g. "Speakers (Realtek …)")
+    /// or "default" for the system default output.
     /// On Linux this is a PulseAudio source name (e.g. "default").
-    /// Leave unset or empty to disable audio.
+    /// Leave unset or empty to let the user choose from the browser toolbar.
     #[serde(default)]
     pub audio_device: Option<String>,
 }

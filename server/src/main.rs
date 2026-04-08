@@ -42,9 +42,10 @@ struct Args {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
 
-    /// Audio capture device name (overrides config file).
-    /// On Windows: DirectShow device name, e.g. "Stereo Mix (Realtek …)"
+    /// Audio output device name for loopback capture (overrides config file).
+    /// On Windows: WASAPI render endpoint name, e.g. "Speakers (Realtek …)" or "default"
     /// On Linux: PulseAudio source name, e.g. "default"
+    /// If not set, audio devices are auto-discovered and the user can select in the browser.
     #[arg(long)]
     audio_device: Option<String>,
 }
@@ -72,9 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty());
 
     if let Some(ref dev) = audio_device {
-        log::info!("Audio device: {dev}");
+        log::info!("Audio loopback device: {dev}");
     } else {
-        log::info!("Audio capture disabled (no audio_device configured)");
+        log::info!("Audio: auto-discovery (user selects in browser)");
     }
 
     let config = server::ServerConfig {
