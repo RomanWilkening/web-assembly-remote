@@ -19,6 +19,7 @@ use crate::config::AuthConfig;
 use crate::cursor;
 use crate::encoder::{EncodedFrame, FfmpegEncoder};
 use crate::input::InputSimulator;
+use crate::audio;
 
 pub struct ServerConfig {
     pub addr: SocketAddr,
@@ -27,6 +28,7 @@ pub struct ServerConfig {
     pub encoder: String,
     pub static_dir: String,
     pub auth: AuthConfig,
+    pub audio_device: Option<String>,
 }
 
 #[derive(Clone)]
@@ -35,6 +37,7 @@ struct AppState {
     quality: u8,
     encoder: String,
     auth: AuthState,
+    audio_device: Option<String>,
 }
 
 impl axum::extract::FromRef<AppState> for AuthState {
@@ -51,6 +54,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         quality: cfg.quality,
         encoder: cfg.encoder,
         auth: auth_state.clone(),
+        audio_device: cfg.audio_device,
     };
 
     let app = Router::new()
@@ -195,6 +199,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Channel: cursor info sender.
     let (cursor_tx, mut cursor_rx) = mpsc::channel::<protocol::ServerMessage>(4);
 
+    // Channel: audio capture → WebSocket sender.
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
+
     let fps = state.fps;
     let quality = state.quality;
     let encoder_name = state.encoder.clone();
@@ -222,6 +229,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
+    // ── 3b. Spawn audio capture (if configured) ──
+    let audio_device = state.audio_device.clone();
+    let audio_handle = if let Some(dev) = audio_device {
+        let atx = audio_tx;
+        Some(tokio::task::spawn_blocking(move || {
+            audio::audio_capture_loop(&dev, atx);
+        }))
+    } else {
+        // If audio is not configured, drop the sender so the receiver
+        // side in the send task doesn't keep waiting.
+        drop(audio_tx);
+        None
+    };
+
     // ── 4. Spawn the input handler (blocking thread) ──
     let input_sim = InputSimulator::new(mon_x, mon_y, screen_w as u32, screen_h as u32);
     let input_handle = tokio::task::spawn_blocking(move || {
@@ -239,7 +260,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    // ── 5. WebSocket sender task (video frames + cursor info) ──
+    // ── 5. WebSocket sender task (video frames + cursor info + audio) ──
     let send_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -257,6 +278,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
                 Some(cursor_msg) = cursor_rx.recv() => {
                     let bin = cursor_msg.encode();
+                    if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(audio_data) = audio_rx.recv() => {
+                    let msg = protocol::ServerMessage::AudioData { data: audio_data };
+                    let bin = msg.encode();
                     if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
                         break;
                     }
@@ -280,6 +308,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     log::info!("WebSocket client disconnected");
     drop(input_tx);
     capture_handle.abort();
+    if let Some(h) = audio_handle {
+        h.abort();
+    }
     let _ = send_handle.await;
     let _ = input_handle.await;
 }

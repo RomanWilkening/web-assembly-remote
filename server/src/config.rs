@@ -6,6 +6,12 @@ use std::path::Path;
 pub struct AppConfig {
     /// Authentication settings.
     pub auth: AuthConfig,
+    /// Optional audio capture device name.
+    /// On Windows this is a DirectShow device name (e.g. "Stereo Mix (Realtek …)").
+    /// On Linux this is a PulseAudio source name (e.g. "default").
+    /// Leave unset or empty to disable audio.
+    #[serde(default)]
+    pub audio_device: Option<String>,
 }
 
 /// Authentication credentials.

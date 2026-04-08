@@ -1,3 +1,4 @@
+mod audio;
 mod auth;
 mod capture;
 mod config;
@@ -40,6 +41,12 @@ struct Args {
     /// Path to configuration file (TOML)
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Audio capture device name (overrides config file).
+    /// On Windows: DirectShow device name, e.g. "Stereo Mix (Realtek …)"
+    /// On Linux: PulseAudio source name, e.g. "default"
+    #[arg(long)]
+    audio_device: Option<String>,
 }
 
 #[tokio::main]
@@ -58,6 +65,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Encoder: {}, FPS: {}, Quality (QP): {}", args.encoder, args.fps, args.quality);
     log::info!("Static files: {}", args.static_dir);
 
+    // Determine audio device: CLI flag takes precedence over config file.
+    let audio_device = args
+        .audio_device
+        .or(app_config.audio_device)
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref dev) = audio_device {
+        log::info!("Audio device: {dev}");
+    } else {
+        log::info!("Audio capture disabled (no audio_device configured)");
+    }
+
     let config = server::ServerConfig {
         addr,
         fps: args.fps,
@@ -65,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         encoder: args.encoder,
         static_dir: args.static_dir,
         auth: app_config.auth,
+        audio_device,
     };
 
     server::run(config).await
