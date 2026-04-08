@@ -111,6 +111,48 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    // ── 0b. Enumerate audio devices and send AudioDeviceList ──
+    let audio_devices = tokio::task::spawn_blocking(audio::enumerate_audio_devices)
+        .await
+        .unwrap_or_default();
+
+    // Limit to 255 devices (u8 count in the protocol).
+    let audio_devices = if audio_devices.len() > 255 {
+        log::warn!(
+            "Found {} audio devices, limiting to 255 in the protocol",
+            audio_devices.len()
+        );
+        audio_devices[..255].to_vec()
+    } else {
+        audio_devices
+    };
+
+    let audio_device_list: Vec<protocol::AudioDeviceInfo> = audio_devices
+        .iter()
+        .enumerate()
+        .map(|(i, name)| protocol::AudioDeviceInfo {
+            index: i as u8,
+            name: name.clone(),
+        })
+        .collect();
+
+    // Always send the list (even if empty – tells client no devices available).
+    let audio_list_msg = protocol::ServerMessage::AudioDeviceList {
+        devices: audio_device_list,
+    };
+    log::info!("Sending AudioDeviceList: {} device(s)", audio_devices.len());
+    for (i, name) in audio_devices.iter().enumerate() {
+        log::info!("  Audio device {i}: \"{name}\"");
+    }
+    if ws_tx
+        .send(Message::Binary(audio_list_msg.encode().into()))
+        .await
+        .is_err()
+    {
+        log::error!("Failed to send AudioDeviceList – client disconnected");
+        return;
+    }
+
     // ── 1. Wait for ClientReady or SelectMonitor ──────────────
     let mut selected_monitor: usize = 0; // default to primary
 
@@ -202,6 +244,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Channel: audio capture → WebSocket sender.
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
 
+    // Channel: audio device control (None = stop, Some(name) = start).
+    let (audio_ctl_tx, mut audio_ctl_rx) = mpsc::channel::<Option<String>>(4);
+
     let fps = state.fps;
     let quality = state.quality;
     let encoder_name = state.encoder.clone();
@@ -229,18 +274,50 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    // ── 3b. Spawn audio capture (if configured) ──
-    let audio_device = state.audio_device.clone();
-    let audio_handle = if let Some(dev) = audio_device {
+    // ── 3b. Audio control task ──
+    // Manages starting/stopping the FFmpeg audio capture thread based on
+    // client requests.  If a default audio device was configured, start it
+    // immediately so existing behaviour is preserved.
+    let default_audio = state.audio_device.clone();
+    let audio_ctl_handle = {
         let atx = audio_tx;
-        Some(tokio::task::spawn_blocking(move || {
-            audio::audio_capture_loop(&dev, atx);
-        }))
-    } else {
-        // If audio is not configured, drop the sender so the receiver
-        // side in the send task doesn't keep waiting.
-        drop(audio_tx);
-        None
+        tokio::spawn(async move {
+            let mut current_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+            // Helper: start a new audio capture for the given device.
+            let start = |dev: String, tx: mpsc::Sender<Vec<u8>>| {
+                tokio::task::spawn_blocking(move || {
+                    audio::audio_capture_loop(&dev, tx);
+                })
+            };
+
+            // Auto-start if a default device was configured.
+            if let Some(ref dev) = default_audio {
+                log::info!("Auto-starting audio capture for configured device: \"{dev}\"");
+                current_handle = Some(start(dev.clone(), atx.clone()));
+            }
+
+            while let Some(cmd) = audio_ctl_rx.recv().await {
+                // Stop current audio capture (if any).
+                if let Some(h) = current_handle.take() {
+                    h.abort();
+                    let _ = h.await;
+                }
+
+                // Start new capture if a device was requested.
+                if let Some(dev) = cmd {
+                    log::info!("Starting audio capture for device: \"{dev}\"");
+                    current_handle = Some(start(dev, atx.clone()));
+                } else {
+                    log::info!("Audio capture stopped by client");
+                }
+            }
+
+            // Channel closed – stop any running capture.
+            if let Some(h) = current_handle.take() {
+                h.abort();
+            }
+        })
     };
 
     // ── 4. Spawn the input handler (blocking thread) ──
@@ -254,6 +331,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Client should disconnect and reconnect with new selection.
                         log::info!("Monitor switch requested – client should reconnect");
                     }
+                    // SelectAudio is handled in the WS receiver, not here.
+                    protocol::ClientMessage::SelectAudio { .. } => {}
                     other => input_sim.handle(other),
                 }
             }
@@ -298,7 +377,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Binary(data) => {
-                let _ = input_tx.try_send(data.to_vec());
+                // Intercept audio device selection before forwarding to
+                // the input handler, because it needs async handling.
+                if let Some(protocol::ClientMessage::SelectAudio { index }) =
+                    protocol::ClientMessage::decode(&data)
+                {
+                    let cmd = if index == 0xFF {
+                        None
+                    } else {
+                        audio_devices.get(index as usize).cloned()
+                    };
+                    let _ = audio_ctl_tx.send(cmd).await;
+                } else {
+                    let _ = input_tx.try_send(data.to_vec());
+                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -307,10 +399,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     log::info!("WebSocket client disconnected");
     drop(input_tx);
+    drop(audio_ctl_tx);
     capture_handle.abort();
-    if let Some(h) = audio_handle {
-        h.abort();
-    }
+    audio_ctl_handle.abort();
     let _ = send_handle.await;
     let _ = input_handle.await;
 }

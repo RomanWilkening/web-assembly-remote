@@ -13,11 +13,12 @@ import { InputHandler }  from './input.js';
 import { AudioPlayer }   from './audio.js';
 
 // Message-type constants (must match protocol crate).
-const MSG_VIDEO_FRAME  = 0x01;
-const MSG_SERVER_INFO  = 0x02;
-const MSG_CURSOR_INFO  = 0x03;
-const MSG_MONITOR_LIST = 0x04;
-const MSG_AUDIO_DATA   = 0x05;
+const MSG_VIDEO_FRAME        = 0x01;
+const MSG_SERVER_INFO        = 0x02;
+const MSG_CURSOR_INFO        = 0x03;
+const MSG_MONITOR_LIST       = 0x04;
+const MSG_AUDIO_DATA         = 0x05;
+const MSG_AUDIO_DEVICE_LIST  = 0x06;
 
 // ---------------------------------------------------------------------------
 // WASM loading with explicit fetch, timeout, and retry.
@@ -100,6 +101,7 @@ async function main() {
   const btnFullscreen   = document.getElementById('btn-fullscreen');
   const btnPointerLock  = document.getElementById('btn-pointerlock');
   const btnStream       = document.getElementById('btn-stream');
+  const audioSelect     = document.getElementById('audio-select');
   const btnMute         = document.getElementById('btn-mute');
   const btnLogout       = document.getElementById('btn-logout');
   const remoteCursor    = document.getElementById('remote-cursor');
@@ -112,6 +114,13 @@ async function main() {
   let remoteH = 0;
   /** @type {WebSocket|null} */
   let ws = null;
+
+  /** Send binary data over the WebSocket (if connected). */
+  const send = (data) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
+  };
 
   // ── 1. Load WASM ─────────────────────────────────────────────
   statusEl.textContent = 'Loading WASM module…';
@@ -288,6 +297,26 @@ async function main() {
     btnMute.textContent = nowMuted ? '🔊 Mute' : '🔇 Unmute';
   });
 
+  // ── 8c. Audio device selector ───────────────────────────────
+  audioSelect.addEventListener('change', () => {
+    const val = audioSelect.value;
+    if (val === 'off') {
+      // Send 0xFF to disable audio.
+      send(wasm.encode_select_audio(0xFF));
+      audioPlayer.setMuted(true);
+      btnMute.textContent = '🔇 Unmute';
+    } else {
+      const idx = parseInt(val, 10);
+      if (isNaN(idx)) return;
+      send(wasm.encode_select_audio(idx));
+      // Auto-unmute and re-initialise audio when a device is selected.
+      audioPlayer.init().then(() => {
+        audioPlayer.setMuted(false);
+        btnMute.textContent = '🔊 Mute';
+      }).catch((e) => console.warn('Audio init on device select:', e));
+    }
+  });
+
   // ── 9. Monitor selector ──────────────────────────────────────
   monitorSelect.addEventListener('change', () => {
     const idx = parseInt(monitorSelect.value);
@@ -331,12 +360,6 @@ async function main() {
 
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
-
-    const send = (data) => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(data);
-      }
-    };
 
     ws.addEventListener('open', () => {
       statusEl.textContent = 'Connected – waiting for first frame…';
@@ -384,6 +407,30 @@ async function main() {
             opt.value    = idx.toString();
             opt.textContent = `Monitor ${idx}${prim ? ' (Primary)' : ''} – ${mw}×${mh}`;
             monitorSelect.appendChild(opt);
+          }
+          break;
+        }
+
+        case MSG_AUDIO_DEVICE_LIST: {
+          const count = wasm.audio_device_list_count(data);
+          console.log(`AudioDeviceList: ${count} device(s)`);
+
+          // Update audio device selector.
+          audioSelect.innerHTML = '';
+
+          // "Off" option to disable audio capture.
+          const offOpt = document.createElement('option');
+          offOpt.value = 'off';
+          offOpt.textContent = 'Off';
+          audioSelect.appendChild(offOpt);
+
+          for (let i = 0; i < count; i++) {
+            const idx  = wasm.audio_device_index(data, i);
+            const name = wasm.audio_device_name(data, i);
+            const opt  = document.createElement('option');
+            opt.value  = idx.toString();
+            opt.textContent = name;
+            audioSelect.appendChild(opt);
           }
           break;
         }

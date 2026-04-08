@@ -6,6 +6,179 @@ use tokio::sync::mpsc;
 /// 960 samples × 2 channels × 4 bytes = 7680 bytes.
 const CHUNK_BYTES: usize = 960 * 2 * 4;
 
+/// Enumerate available audio capture devices using FFmpeg.
+///
+/// On Windows this runs `ffmpeg -list_devices true -f dshow -i dummy` and
+/// parses the DirectShow audio device names from stderr.
+///
+/// On Linux this runs `ffmpeg -sources pulse` and parses PulseAudio source
+/// names from stderr.
+///
+/// Returns a list of human-readable device names.  The order is stable
+/// (FFmpeg lists them deterministically) so the caller can use the index
+/// to refer back to a specific device.
+pub fn enumerate_audio_devices() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        enumerate_audio_devices_dshow()
+    }
+    #[cfg(not(windows))]
+    {
+        enumerate_audio_devices_pulse()
+    }
+}
+
+/// Windows: parse DirectShow audio device names.
+#[cfg(windows)]
+fn enumerate_audio_devices_dshow() -> Vec<String> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!(
+                "Failed to run FFmpeg for audio device enumeration \
+                 (ensure FFmpeg is installed and in PATH): {e}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_dshow_audio_devices(&stderr)
+}
+
+/// Parse audio device names from FFmpeg dshow output.
+///
+/// The output looks like:
+/// ```text
+/// [dshow @ ...] DirectShow video devices (...)
+/// [dshow @ ...]  "Integrated Camera"
+/// [dshow @ ...] Alternative name "..."
+/// [dshow @ ...] DirectShow audio devices
+/// [dshow @ ...]  "Stereo Mix (Realtek ...)"
+/// [dshow @ ...] Alternative name "..."
+/// [dshow @ ...]  "Microphone (Realtek ...)"
+/// [dshow @ ...] Alternative name "..."
+/// ```
+///
+/// We look for lines after "DirectShow audio devices" that contain a
+/// quoted device name (but skip "Alternative name" lines).
+#[cfg(any(windows, test))]
+fn parse_dshow_audio_devices(stderr: &str) -> Vec<String> {
+    let mut devices = Vec::new();
+    let mut in_audio_section = false;
+
+    for line in stderr.lines() {
+        // Strip the `[dshow @ 0x...]` prefix to get the payload.
+        let payload = match line.find(']') {
+            Some(pos) => line[pos + 1..].trim(),
+            None => line.trim(),
+        };
+
+        if payload.contains("DirectShow audio devices") {
+            in_audio_section = true;
+            continue;
+        }
+        // A new section header ends the audio section.
+        if payload.contains("DirectShow video devices") {
+            in_audio_section = false;
+            continue;
+        }
+
+        if !in_audio_section {
+            continue;
+        }
+
+        // Skip "Alternative name" lines.
+        if payload.starts_with("Alternative name") {
+            continue;
+        }
+
+        // Extract the quoted device name.
+        if let (Some(start), Some(end)) = (payload.find('"'), payload.rfind('"')) {
+            if start < end {
+                let name = &payload[start + 1..end];
+                if !name.is_empty() {
+                    devices.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    devices
+}
+
+/// Linux: parse PulseAudio source names.
+#[cfg(not(windows))]
+fn enumerate_audio_devices_pulse() -> Vec<String> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-sources", "pulse"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!(
+                "Failed to run FFmpeg for audio device enumeration \
+                 (ensure FFmpeg is installed and in PATH): {e}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_pulse_sources(&stderr)
+}
+
+/// Parse PulseAudio source names from `ffmpeg -sources pulse` output.
+///
+/// Output looks like:
+/// ```text
+/// Auto-detected sources for pulse:
+///   * default [Default]
+///     alsa_output.pci-0000_00_1f.3.analog-stereo.monitor [Monitor of ...]
+/// ```
+#[cfg(not(windows))]
+fn parse_pulse_sources(stderr: &str) -> Vec<String> {
+    let mut devices = Vec::new();
+    let mut in_sources = false;
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Auto-detected sources") {
+            in_sources = true;
+            continue;
+        }
+        if !in_sources {
+            continue;
+        }
+        // Each source line starts with optional `*` then the source name.
+        let source_part = trimmed.trim_start_matches('*').trim();
+        if source_part.is_empty() {
+            continue;
+        }
+        // The name ends at `[` or end-of-line.
+        let name = match source_part.find('[') {
+            Some(pos) => source_part[..pos].trim(),
+            None => source_part,
+        };
+        if !name.is_empty() {
+            devices.push(name.to_string());
+        }
+    }
+
+    devices
+}
+
 /// Capture system audio via FFmpeg and send raw f32le PCM chunks
 /// through the provided channel.
 ///
@@ -106,4 +279,41 @@ fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<
         }
     }
     Ok(filled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dshow_audio_devices_typical() {
+        let stderr = r#"[dshow @ 000001] DirectShow video devices (some may be both video and audio devices)
+[dshow @ 000001]  "Integrated Camera"
+[dshow @ 000001] Alternative name "@device_pnp_\\?\usb"
+[dshow @ 000001] DirectShow audio devices
+[dshow @ 000001]  "Stereo Mix (Realtek High Definition Audio)"
+[dshow @ 000001] Alternative name "@device_cm_{id1}"
+[dshow @ 000001]  "Microphone (Realtek High Definition Audio)"
+[dshow @ 000001] Alternative name "@device_cm_{id2}"
+"#;
+        let devices = parse_dshow_audio_devices(stderr);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0], "Stereo Mix (Realtek High Definition Audio)");
+        assert_eq!(devices[1], "Microphone (Realtek High Definition Audio)");
+    }
+
+    #[test]
+    fn parse_dshow_audio_devices_no_audio() {
+        let stderr = r#"[dshow @ 000001] DirectShow video devices (some may be both video and audio devices)
+[dshow @ 000001]  "Integrated Camera"
+"#;
+        let devices = parse_dshow_audio_devices(stderr);
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn parse_dshow_audio_devices_empty() {
+        let devices = parse_dshow_audio_devices("");
+        assert!(devices.is_empty());
+    }
 }
