@@ -70,6 +70,11 @@ export class InputHandler {
     /** @private */ this._lastMoveTime = 0;
     /** @private */ this._moveThrottleMs = 8; // ~125 Hz max
 
+    // Pointer lock state
+    /** @private */ this._pointerLocked = false;
+    /** @private */ this._virtualX = remoteWidth / 2;
+    /** @private */ this._virtualY = remoteHeight / 2;
+
     this._bindEvents();
   }
 
@@ -77,6 +82,16 @@ export class InputHandler {
   setRemoteSize(w, h) {
     this._remoteW = w;
     this._remoteH = h;
+  }
+
+  /** Set pointer lock state. */
+  setPointerLocked(locked) {
+    this._pointerLocked = locked;
+    if (locked) {
+      // Initialize virtual cursor to center of remote screen
+      this._virtualX = this._remoteW / 2;
+      this._virtualY = this._remoteH / 2;
+    }
   }
 
   // ---------- internal ----------
@@ -93,6 +108,22 @@ export class InputHandler {
   }
 
   /** @private */
+  _handlePointerLockMove(movementX, movementY) {
+    // Apply movement to virtual cursor position
+    const rect = this._canvas.getBoundingClientRect();
+    const sx = this._remoteW / rect.width;
+    const sy = this._remoteH / rect.height;
+
+    this._virtualX = Math.max(0, Math.min(this._remoteW, this._virtualX + movementX * sx));
+    this._virtualY = Math.max(0, Math.min(this._remoteH, this._virtualY + movementY * sy));
+
+    return {
+      x: Math.round(this._virtualX),
+      y: Math.round(this._virtualY),
+    };
+  }
+
+  /** @private */
   _bindEvents() {
     const c = this._canvas;
 
@@ -102,19 +133,44 @@ export class InputHandler {
       if (now - this._lastMoveTime < this._moveThrottleMs) return;
       this._lastMoveTime = now;
 
-      const { x, y } = this._toRemote(e.clientX, e.clientY);
+      let x, y;
+      if (this._pointerLocked) {
+        const pos = this._handlePointerLockMove(e.movementX, e.movementY);
+        x = pos.x;
+        y = pos.y;
+      } else {
+        const pos = this._toRemote(e.clientX, e.clientY);
+        x = pos.x;
+        y = pos.y;
+      }
       this._send(this._wasm.encode_mouse_move(x, y));
     });
 
     c.addEventListener('mousedown', (e) => {
       e.preventDefault();
-      const { x, y } = this._toRemote(e.clientX, e.clientY);
+      let x, y;
+      if (this._pointerLocked) {
+        x = Math.round(this._virtualX);
+        y = Math.round(this._virtualY);
+      } else {
+        const pos = this._toRemote(e.clientX, e.clientY);
+        x = pos.x;
+        y = pos.y;
+      }
       this._send(this._wasm.encode_mouse_button(e.button, true, x, y));
     });
 
     c.addEventListener('mouseup', (e) => {
       e.preventDefault();
-      const { x, y } = this._toRemote(e.clientX, e.clientY);
+      let x, y;
+      if (this._pointerLocked) {
+        x = Math.round(this._virtualX);
+        y = Math.round(this._virtualY);
+      } else {
+        const pos = this._toRemote(e.clientX, e.clientY);
+        x = pos.x;
+        y = pos.y;
+      }
       this._send(this._wasm.encode_mouse_button(e.button, false, x, y));
     });
 
@@ -129,6 +185,10 @@ export class InputHandler {
 
     // ── Keyboard ──
     c.addEventListener('keydown', (e) => {
+      // Don't intercept Ctrl+Alt+M (pointer lock toggle) or Escape (toolbar)
+      if ((e.ctrlKey && e.altKey && e.code === 'KeyM') || e.key === 'Escape') {
+        return;
+      }
       e.preventDefault();
       const vk = VK_MAP[e.code];
       if (vk !== undefined) {
@@ -137,6 +197,9 @@ export class InputHandler {
     });
 
     c.addEventListener('keyup', (e) => {
+      if ((e.ctrlKey && e.altKey && e.code === 'KeyM') || e.key === 'Escape') {
+        return;
+      }
       e.preventDefault();
       const vk = VK_MAP[e.code];
       if (vk !== undefined) {

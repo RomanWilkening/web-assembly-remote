@@ -13,6 +13,39 @@
     <p id="latency"></p>
   </div>
 
+  <!-- Control toolbar (top-right, toggled with Escape) -->
+  <div id="toolbar" class="hidden">
+    <div class="toolbar-group">
+      <label>Monitor:</label>
+      <select id="monitor-select" title="Select monitor">
+        <option value="0">Primary</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <label>Scale:</label>
+      <select id="scale-select" title="Display scale">
+        <option value="fit">Fit</option>
+        <option value="100">100%</option>
+        <option value="75">75%</option>
+        <option value="50">50%</option>
+      </select>
+    </div>
+    <button id="btn-fullscreen" title="Toggle fullscreen (F11)">⛶ Fullscreen</button>
+    <button id="btn-pointerlock" title="Lock mouse (Ctrl+Alt+M)">🔓 Lock Mouse</button>
+    <button id="btn-stream" title="Stop/start stream">⏹ Stop</button>
+    <button id="btn-logout" title="Log out">🚪 Logout</button>
+  </div>
+
+  <!-- Remote cursor overlay (drawn above canvas) -->
+  <div id="remote-cursor" class="hidden">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M2 2L8 18L10.5 10.5L18 8L2 2Z" fill="white" stroke="black" stroke-width="1.2"/>
+    </svg>
+  </div>
+
+  <!-- Pointer-lock indicator -->
+  <div id="lock-indicator" class="hidden">🔒 Mouse locked – Ctrl+Alt+M to unlock</div>
+
   <!-- Remote desktop canvas (receives decoded video frames) -->
   <canvas id="screen" tabindex="0"></canvas>
 

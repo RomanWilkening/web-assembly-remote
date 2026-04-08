@@ -2,8 +2,8 @@ use wasm_bindgen::prelude::*;
 
 // Re-export protocol constants so JS can reference them if needed.
 pub use protocol::{
-    MSG_CLIENT_READY, MSG_KEY_EVENT, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE,
-    MSG_MOUSE_SCROLL, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
+    MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON,
+    MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL, MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,11 @@ pub fn encode_mouse_scroll(delta_x: i16, delta_y: i16) -> Vec<u8> {
 #[wasm_bindgen]
 pub fn encode_key_event(key_code: u16, pressed: bool) -> Vec<u8> {
     protocol::ClientMessage::KeyEvent { key_code, pressed }.encode()
+}
+
+#[wasm_bindgen]
+pub fn encode_select_monitor(index: u8) -> Vec<u8> {
+    protocol::ClientMessage::SelectMonitor { index }.encode()
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +102,110 @@ pub fn server_info_fps(data: &[u8]) -> u8 {
         return 0;
     }
     data[5]
+}
+
+// ---------------------------------------------------------------------------
+// Cursor info decode helpers
+// ---------------------------------------------------------------------------
+
+/// For a CursorInfo message, extract X position.
+#[wasm_bindgen]
+pub fn cursor_info_x(data: &[u8]) -> u16 {
+    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
+        return 0;
+    }
+    u16::from_le_bytes(data[1..3].try_into().unwrap_or_default())
+}
+
+/// For a CursorInfo message, extract Y position.
+#[wasm_bindgen]
+pub fn cursor_info_y(data: &[u8]) -> u16 {
+    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
+        return 0;
+    }
+    u16::from_le_bytes(data[3..5].try_into().unwrap_or_default())
+}
+
+/// For a CursorInfo message, extract visibility.
+#[wasm_bindgen]
+pub fn cursor_info_visible(data: &[u8]) -> bool {
+    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
+        return false;
+    }
+    data[5] != 0
+}
+
+// ---------------------------------------------------------------------------
+// Monitor list decode helpers
+// ---------------------------------------------------------------------------
+
+/// For a MonitorList message, extract the number of monitors.
+#[wasm_bindgen]
+pub fn monitor_list_count(data: &[u8]) -> u8 {
+    if data.len() < 2 || data[0] != MSG_MONITOR_LIST {
+        return 0;
+    }
+    data[1]
+}
+
+/// For a MonitorList message, extract a monitor's index.
+#[wasm_bindgen]
+pub fn monitor_info_index(data: &[u8], i: u8) -> u8 {
+    let off = 2 + (i as usize) * 10;
+    if data.len() < off + 10 || data[0] != MSG_MONITOR_LIST {
+        return 0;
+    }
+    data[off]
+}
+
+/// For a MonitorList message, extract a monitor's X offset.
+#[wasm_bindgen]
+pub fn monitor_info_x(data: &[u8], i: u8) -> i16 {
+    let off = 2 + (i as usize) * 10;
+    if data.len() < off + 10 || data[0] != MSG_MONITOR_LIST {
+        return 0;
+    }
+    i16::from_le_bytes(data[off + 1..off + 3].try_into().unwrap_or_default())
+}
+
+/// For a MonitorList message, extract a monitor's Y offset.
+#[wasm_bindgen]
+pub fn monitor_info_y(data: &[u8], i: u8) -> i16 {
+    let off = 2 + (i as usize) * 10;
+    if data.len() < off + 10 || data[0] != MSG_MONITOR_LIST {
+        return 0;
+    }
+    i16::from_le_bytes(data[off + 3..off + 5].try_into().unwrap_or_default())
+}
+
+/// For a MonitorList message, extract a monitor's width.
+#[wasm_bindgen]
+pub fn monitor_info_width(data: &[u8], i: u8) -> u16 {
+    let off = 2 + (i as usize) * 10;
+    if data.len() < off + 10 || data[0] != MSG_MONITOR_LIST {
+        return 0;
+    }
+    u16::from_le_bytes(data[off + 5..off + 7].try_into().unwrap_or_default())
+}
+
+/// For a MonitorList message, extract a monitor's height.
+#[wasm_bindgen]
+pub fn monitor_info_height(data: &[u8], i: u8) -> u16 {
+    let off = 2 + (i as usize) * 10;
+    if data.len() < off + 10 || data[0] != MSG_MONITOR_LIST {
+        return 0;
+    }
+    u16::from_le_bytes(data[off + 7..off + 9].try_into().unwrap_or_default())
+}
+
+/// For a MonitorList message, check if a monitor is primary.
+#[wasm_bindgen]
+pub fn monitor_info_primary(data: &[u8], i: u8) -> bool {
+    let off = 2 + (i as usize) * 10;
+    if data.len() < off + 10 || data[0] != MSG_MONITOR_LIST {
+        return false;
+    }
+    data[off + 9] != 0
 }
 
 // ---------------------------------------------------------------------------

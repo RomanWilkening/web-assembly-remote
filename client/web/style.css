@@ -46,3 +46,99 @@ html, body {
   font-variant-numeric: tabular-nums;
   color: #6f6;
 }
+
+/* Control toolbar (top-right) */
+#toolbar {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(8px);
+  font-size: 13px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: opacity 0.3s, transform 0.3s;
+}
+
+#toolbar.hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-10px);
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toolbar-group label {
+  font-size: 12px;
+  color: #aaa;
+}
+
+#toolbar select {
+  background: #222;
+  color: #eee;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#toolbar button {
+  background: #333;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.2s;
+  white-space: nowrap;
+}
+
+#toolbar button:hover {
+  background: #4a9eff;
+  border-color: #4a9eff;
+}
+
+/* Remote cursor overlay */
+#remote-cursor {
+  position: fixed;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 5;
+  transition: none;
+}
+
+#remote-cursor.hidden {
+  display: none;
+}
+
+/* Pointer lock indicator */
+#lock-indicator {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 18px;
+  border-radius: 20px;
+  background: rgba(255, 165, 0, 0.85);
+  color: #000;
+  font-size: 13px;
+  font-weight: 600;
+  z-index: 30;
+  pointer-events: none;
+  transition: opacity 0.3s;
+}
+
+#lock-indicator.hidden {
+  opacity: 0;
+}
