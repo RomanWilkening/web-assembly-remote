@@ -2,12 +2,9 @@ name: Build & Release (Windows)
 
 on:
   push:
-    branches: ["**"]
-    tags: ["v*"]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-    branches: ["**"]
+    branches: ["**"]         # alle Branches bauen
+    tags: ["v*.*.*"]         # semantische Tags publishen
+  workflow_dispatch:         # manuell auslösbar
 
 permissions:
   contents: write
