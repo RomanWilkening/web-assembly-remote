@@ -46,6 +46,22 @@ async function main() {
   // ── 1. Load WASM ─────────────────────────────────────────────
   statusEl.textContent = 'Loading WASM module…';
 
+  // Verify that the session is still valid before doing anything.
+  // When a proxy strips the session cookie from sub-resource requests the
+  // module scripts load fine (they are served without auth), but the
+  // WebSocket will be rejected with 401.  Checking here gives a clean
+  // redirect to /login rather than a cryptic "Connection error".
+  try {
+    const sessionRes = await fetch('/api/session', { credentials: 'same-origin' });
+    if (!sessionRes.ok) {
+      window.location.href = '/login';
+      return;
+    }
+  } catch (e) {
+    window.location.href = '/login';
+    return;
+  }
+
   let wasm;
   try {
     wasm = await import('../pkg/wasm_remote_client.js');

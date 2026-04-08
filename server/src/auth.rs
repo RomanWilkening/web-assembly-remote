@@ -97,7 +97,15 @@ fn extract_session_token(req: &Request<Body>) -> Option<String> {
 }
 
 /// Axum middleware that enforces authentication.
-/// Allows access to /login and /api/login without a valid session.
+///
+/// Public routes (no session required):
+/// - `/login`, `/api/login` – login page and login endpoint
+/// - Any path ending in a static-asset extension (`.js`, `.wasm`, `.css`,
+///   `.png`, `.ico`) – these are not sensitive; protecting them causes module
+///   load failures when SSL-inspecting proxies (e.g. Netskope) strip cookies
+///   from browser sub-resource requests.  The WebSocket endpoint enforces
+///   auth separately, so an unauthenticated client gains nothing from reading
+///   the JS/WASM source.
 pub async fn auth_middleware(
     State(auth): State<AuthState>,
     req: Request<Body>,
@@ -106,7 +114,19 @@ pub async fn auth_middleware(
     let path = req.uri().path().to_string();
 
     // Allow unauthenticated access to the login page and login API.
-    if path == "/login" || path == "/api/login" || path == "/login.css" {
+    if path == "/login" || path == "/api/login" {
+        return next.run(req).await;
+    }
+
+    // Allow static assets without auth so that <script type="module"> loads
+    // succeed even when a proxy strips the session cookie from sub-resource
+    // requests.
+    if path.ends_with(".js")
+        || path.ends_with(".wasm")
+        || path.ends_with(".css")
+        || path.ends_with(".png")
+        || path.ends_with(".ico")
+    {
         return next.run(req).await;
     }
 
@@ -123,6 +143,22 @@ pub async fn auth_middleware(
     } else {
         Redirect::to("/login").into_response()
     }
+}
+
+/// Check whether the current request carries a valid session.
+/// Returns `200 OK` when authenticated, `401 Unauthorized` when not.
+/// The client JavaScript calls this on start-up so it can redirect to the
+/// login page gracefully if the session has expired.
+pub async fn session_check(
+    State(auth): State<AuthState>,
+    req: Request<Body>,
+) -> Response {
+    if let Some(token) = extract_session_token(&req) {
+        if auth.is_valid_session(&token) {
+            return StatusCode::OK.into_response();
+        }
+    }
+    StatusCode::UNAUTHORIZED.into_response()
 }
 
 // --- Login page ---

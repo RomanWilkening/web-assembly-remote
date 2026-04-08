@@ -58,6 +58,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         .route("/login", get(auth::login_page))
         .route("/api/login", post(auth::login_handler))
         .route("/api/logout", post(auth::logout_handler))
+        .route("/api/session", get(auth::session_check))
         .fallback_service(ServeDir::new(&cfg.static_dir))
         .layer(middleware::from_fn_with_state(
             auth_state,
