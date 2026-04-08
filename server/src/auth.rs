@@ -140,6 +140,14 @@ pub struct LoginForm {
 }
 
 /// Handle login form submission.
+///
+/// Returns a plain 200 response with `Set-Cookie` on success, or 401 on
+/// failure.  The login page uses `fetch()` to call this endpoint and
+/// navigates to `/` via JavaScript after a successful response.
+///
+/// This avoids a 303 redirect, which is important because SSL-inspecting
+/// proxies (e.g. Netskope) may follow the redirect server-side and strip
+/// the `Set-Cookie` header before the browser ever sees it.
 pub async fn login_handler(
     State(auth): State<AuthState>,
     req: Request<Body>,
@@ -149,26 +157,16 @@ pub async fn login_handler(
     let form = match axum::Form::<LoginForm>::from_request(req, &()).await {
         Ok(Form(f)) => f,
         Err(_) => {
-            return Html(include_str!("../static_auth/login_failed.html")).into_response();
+            return StatusCode::BAD_REQUEST.into_response();
         }
     };
 
     match auth.login(&form.username, &form.password) {
         Some(token) => {
             let cookie = build_session_cookie(&token, 86400, is_https);
-            (
-                StatusCode::SEE_OTHER,
-                [
-                    (header::SET_COOKIE, cookie),
-                    (header::LOCATION, "/".to_string()),
-                ],
-            )
-                .into_response()
+            (StatusCode::OK, [(header::SET_COOKIE, cookie)]).into_response()
         }
-        None => {
-            // Return login page with error message.
-            Html(include_str!("../static_auth/login_failed.html")).into_response()
-        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
