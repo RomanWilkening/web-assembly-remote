@@ -283,9 +283,9 @@ async function main() {
 
   // ── 8b. Mute / unmute toggle ────────────────────────────────
   btnMute.addEventListener('click', () => {
-    const willMute = !audioPlayer.muted;
-    audioPlayer.setMuted(willMute);
-    btnMute.textContent = willMute ? '🔇 Unmute' : '🔊 Mute';
+    const nowMuted = audioPlayer.muted;
+    audioPlayer.setMuted(!nowMuted);
+    btnMute.textContent = nowMuted ? '🔊 Mute' : '🔇 Unmute';
   });
 
   // ── 9. Monitor selector ──────────────────────────────────────

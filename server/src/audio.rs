@@ -78,13 +78,13 @@ fn run_capture(
         })?;
 
     // Read fixed-size chunks (20 ms each) from FFmpeg stdout.
-    let mut buf = vec![0u8; CHUNK_BYTES];
     loop {
-        if read_exact_or_eof(&mut stdout, &mut buf)? == 0 {
+        let mut chunk = vec![0u8; CHUNK_BYTES];
+        if read_exact_or_eof(&mut stdout, &mut chunk)? == 0 {
             log::info!("FFmpeg audio stdout closed");
             break;
         }
-        if audio_tx.blocking_send(buf.clone()).is_err() {
+        if audio_tx.blocking_send(chunk).is_err() {
             log::info!("Audio channel closed – stopping capture");
             break;
         }

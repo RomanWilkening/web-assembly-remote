@@ -234,7 +234,7 @@ impl ServerMessage {
                 }
                 Some(ServerMessage::MonitorList { monitors })
             }
-            MSG_AUDIO_DATA if data.len() >= 2 => {
+            MSG_AUDIO_DATA if data.len() > 1 => {
                 Some(ServerMessage::AudioData { data: data[1..].to_vec() })
             }
             _ => None,
