@@ -110,10 +110,10 @@ fn run_wasapi_loopback(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::VecDeque;
 
-    // Initialize COM on this thread.
+    // Initialize COM on this thread (HRESULT::ok() → Result).
     wasapi::initialize_mta()
         .ok()
-        .map_err(|e| format!("COM initialisation failed: {e:?}"))?;
+        .map_err(|e| format!("COM initialization failed: {e}"))?;
 
     let enumerator = wasapi::DeviceEnumerator::new()?;
 
