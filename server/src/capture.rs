@@ -153,6 +153,10 @@ fn enumerate_monitors_win32() -> Vec<protocol::MonitorInfo> {
 
     // Sort: primary first, then by (x, y) so the order is deterministic and
     // closely matches the typical DXGI (scrap) enumeration order.
+    // NOTE: If the DXGI and GDI orders diverge on a specific machine, the
+    // monitor indices could be mismatched.  In practice both APIs enumerate
+    // the primary display first and then secondary displays left-to-right,
+    // so a sorted-by-position ordering is the best heuristic available.
     win32_rects.sort_by(|a, b| {
         b.primary.cmp(&a.primary)
             .then(a.x.cmp(&b.x))
@@ -162,6 +166,14 @@ fn enumerate_monitors_win32() -> Vec<protocol::MonitorInfo> {
     // Build the protocol MonitorInfo list.  We also cross-check against scrap
     // to use the same count (scrap is the source of truth for capture).
     let scrap_count = Display::all().map(|d| d.len()).unwrap_or(0);
+    if scrap_count != win32_rects.len() {
+        log::warn!(
+            "Monitor count mismatch: scrap reports {} display(s), Win32 reports {} — \
+             using the smaller value",
+            scrap_count,
+            win32_rects.len()
+        );
+    }
     let count = scrap_count.min(win32_rects.len());
 
     (0..count)

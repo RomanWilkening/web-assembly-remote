@@ -336,17 +336,9 @@ fn capture_loop(
 
         // Send cursor position (only when it changes or every ~10 frames).
         let (abs_cx, abs_cy, visible) = cursor::get_cursor_position();
-
-        // Check whether the cursor is inside the captured monitor.
-        let on_monitor = (abs_cx as i32) >= monitor_x
-            && (abs_cx as i32) < monitor_x + monitor_w as i32
-            && (abs_cy as i32) >= monitor_y
-            && (abs_cy as i32) < monitor_y + monitor_h as i32;
-
-        // Convert to monitor-relative coordinates, clamped to [0, dimension).
-        let rel_cx = ((abs_cx as i32 - monitor_x).max(0) as u32).min(monitor_w.saturating_sub(1)) as u16;
-        let rel_cy = ((abs_cy as i32 - monitor_y).max(0) as u32).min(monitor_h.saturating_sub(1)) as u16;
-        let show = visible && on_monitor;
+        let (rel_cx, rel_cy, show) = cursor_to_monitor_relative(
+            abs_cx, abs_cy, visible, monitor_x, monitor_y, monitor_w, monitor_h,
+        );
 
         if (rel_cx, rel_cy, show) != last_cursor || frame_no % 10 == 0 {
             last_cursor = (rel_cx, rel_cy, show);
@@ -360,6 +352,31 @@ fn capture_loop(
 
         frame_no += 1;
     }
+}
+
+/// Convert absolute virtual-desktop cursor coordinates to monitor-relative
+/// coordinates, clamped to `[0, dimension)`.  Returns `(rel_x, rel_y, visible)`
+/// where `visible` is false if the cursor is outside the monitor rectangle.
+fn cursor_to_monitor_relative(
+    abs_x: u16,
+    abs_y: u16,
+    visible: bool,
+    mon_x: i32,
+    mon_y: i32,
+    mon_w: u32,
+    mon_h: u32,
+) -> (u16, u16, bool) {
+    let on_monitor = (abs_x as i32) >= mon_x
+        && (abs_x as i32) < mon_x + mon_w as i32
+        && (abs_y as i32) >= mon_y
+        && (abs_y as i32) < mon_y + mon_h as i32;
+
+    let max_x = mon_w.saturating_sub(1);
+    let max_y = mon_h.saturating_sub(1);
+    let rel_x = ((abs_x as i32 - mon_x).max(0) as u32).min(max_x) as u16;
+    let rel_y = ((abs_y as i32 - mon_y).max(0) as u32).min(max_y) as u16;
+
+    (rel_x, rel_y, visible && on_monitor)
 }
 
 fn timestamp_us() -> u64 {
