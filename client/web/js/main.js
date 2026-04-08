@@ -18,6 +18,73 @@ const MSG_CURSOR_INFO  = 0x03;
 const MSG_MONITOR_LIST = 0x04;
 
 // ---------------------------------------------------------------------------
+// WASM loading with explicit fetch, timeout, and retry.
+//
+// SSL-inspecting proxies (e.g. Netskope) can cause the initial .wasm fetch
+// to hang after a login redirect.  We work around this by:
+//   1. Fetching the .wasm binary ourselves with `cache: 'no-cache'` so the
+//      proxy cannot serve a stale / incomplete cached response.
+//   2. Wrapping the fetch in an AbortController timeout.
+//   3. Retrying once on failure before giving up.
+// ---------------------------------------------------------------------------
+
+/**
+ * Load the WASM module with an explicit fetch and timeout.
+ * @param {number} timeoutMs  Maximum time to wait for the .wasm download.
+ * @returns {Promise<object>} The initialised wasm-bindgen module.
+ */
+async function loadWasm(timeoutMs = 15000) {
+  const wasmModule = await import('../pkg/wasm_remote_client.js');
+
+  // Build the URL to the .wasm binary relative to the JS glue module.
+  const wasmUrl = new URL('../pkg/wasm_remote_client_bg.wasm', import.meta.url);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(wasmUrl, {
+      credentials: 'same-origin',
+      signal: controller.signal,
+      // Bypass potentially stale proxy cache after login redirect.
+      cache: 'no-cache',
+    });
+    clearTimeout(timer);
+    // Pass the Response directly to wasm-bindgen init() so it does not
+    // issue its own (potentially cacheable) fetch.
+    await wasmModule.default(response);
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+
+  return wasmModule;
+}
+
+/**
+ * Attempt to load the WASM module, retrying on failure.
+ * @param {HTMLElement} statusEl  Status element for user feedback.
+ * @param {number} maxAttempts    How many times to try (default 2).
+ * @returns {Promise<object>}
+ */
+async function loadWasmWithRetry(statusEl, maxAttempts = 2) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await loadWasm();
+    } catch (e) {
+      console.warn(`WASM load attempt ${attempt}/${maxAttempts} failed:`, e);
+      if (attempt < maxAttempts) {
+        statusEl.textContent = 'Retrying WASM load…';
+        // Brief pause before retrying.
+        await new Promise((r) => setTimeout(r, 500));
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -64,8 +131,7 @@ async function main() {
 
   let wasm;
   try {
-    wasm = await import('../pkg/wasm_remote_client.js');
-    await wasm.default();       // initialise the WASM instance
+    wasm = await loadWasmWithRetry(statusEl);
   } catch (e) {
     statusEl.textContent = `WASM load failed: ${e}`;
     console.error(e);

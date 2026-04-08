@@ -86,29 +86,127 @@ impl ScreenCapture {
 }
 
 /// Enumerate all available displays and return monitor info.
+///
+/// On Windows, uses Win32 `EnumDisplayMonitors` + `GetMonitorInfoW` to obtain
+/// the actual virtual-desktop positions of each monitor. The results are
+/// matched to `scrap::Display::all()` by index so that the indices used for
+/// capture (scrap) and for input coordinate mapping (Win32) are consistent.
 pub fn enumerate_monitors() -> Vec<protocol::MonitorInfo> {
+    #[cfg(windows)]
+    {
+        enumerate_monitors_win32()
+    }
+    #[cfg(not(windows))]
+    {
+        enumerate_monitors_fallback()
+    }
+}
+
+/// Win32 implementation: enumerates monitors with real positions.
+#[cfg(windows)]
+fn enumerate_monitors_win32() -> Vec<protocol::MonitorInfo> {
+    use std::mem;
+    use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
+    use winapi::shared::windef::{HDC, HMONITOR, LPRECT};
+    use winapi::um::winuser::{EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, MONITORINFOF_PRIMARY};
+
+    /// Per-monitor data collected by the EnumDisplayMonitors callback.
+    struct MonRect {
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        primary: bool,
+    }
+
+    unsafe extern "system" fn callback(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: LPRECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let monitors = &mut *(data as *mut Vec<MonRect>);
+        let mut info: MONITORINFO = mem::zeroed();
+        info.cbSize = mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut info) != 0 {
+            let r = info.rcMonitor;
+            monitors.push(MonRect {
+                x: r.left,
+                y: r.top,
+                w: (r.right - r.left) as u32,
+                h: (r.bottom - r.top) as u32,
+                primary: (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+            });
+        }
+        TRUE
+    }
+
+    let mut win32_rects: Vec<MonRect> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(callback),
+            &mut win32_rects as *mut _ as LPARAM,
+        );
+    }
+
+    // Sort: primary first, then by (x, y) so the order is deterministic and
+    // closely matches the typical DXGI (scrap) enumeration order.
+    // NOTE: If the DXGI and GDI orders diverge on a specific machine, the
+    // monitor indices could be mismatched.  In practice both APIs enumerate
+    // the primary display first and then secondary displays left-to-right,
+    // so a sorted-by-position ordering is the best heuristic available.
+    win32_rects.sort_by(|a, b| {
+        b.primary.cmp(&a.primary)
+            .then(a.x.cmp(&b.x))
+            .then(a.y.cmp(&b.y))
+    });
+
+    // Build the protocol MonitorInfo list.  We also cross-check against scrap
+    // to use the same count (scrap is the source of truth for capture).
+    let scrap_count = Display::all().map(|d| d.len()).unwrap_or(0);
+    if scrap_count != win32_rects.len() {
+        log::warn!(
+            "Monitor count mismatch: scrap reports {} display(s), Win32 reports {} — \
+             using the smaller value",
+            scrap_count,
+            win32_rects.len()
+        );
+    }
+    let count = scrap_count.min(win32_rects.len());
+
+    (0..count)
+        .map(|i| {
+            let r = &win32_rects[i];
+            protocol::MonitorInfo {
+                index: i as u8,
+                x: r.x as i16,
+                y: r.y as i16,
+                width: r.w as u16,
+                height: r.h as u16,
+                primary: r.primary,
+            }
+        })
+        .collect()
+}
+
+/// Fallback for non-Windows: uses scrap only (no position data).
+#[cfg(not(windows))]
+fn enumerate_monitors_fallback() -> Vec<protocol::MonitorInfo> {
     match Display::all() {
         Ok(displays) => {
-            let primary = Display::primary().ok();
-            let primary_dims = primary.as_ref().map(|d| (d.width(), d.height()));
-
             displays
                 .iter()
                 .enumerate()
                 .map(|(i, d)| {
-                    // scrap doesn't expose position, so we use index-based identification.
-                    // Primary detection is approximate.
-                    let is_primary = match &primary_dims {
-                        Some((pw, ph)) if i == 0 => d.width() == *pw && d.height() == *ph,
-                        _ => i == 0,
-                    };
                     protocol::MonitorInfo {
                         index: i as u8,
-                        x: 0,   // scrap doesn't expose monitor offset
+                        x: 0,
                         y: 0,
                         width: d.width() as u16,
                         height: d.height() as u16,
-                        primary: is_primary,
+                        primary: i == 0,
                     }
                 })
                 .collect()
