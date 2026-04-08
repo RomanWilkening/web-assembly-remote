@@ -28,16 +28,32 @@ impl ScreenCapture {
         self.height
     }
 
-    /// Capture a single frame. Returns BGRA pixel data.
-    /// Spins briefly when no new frame is available (DXGI
-    /// signals `WouldBlock` until the desktop
-    /// presents a new
-    /// composition).
+    /// Capture a single frame. Returns tightly-packed BGRA pixel data
+    /// (stride == width × 4).
+    ///
+    /// On Windows/DXGI the mapped surface may have a row pitch larger
+    /// than `width * 4`. We strip the padding so FFmpeg receives the
+    /// exact frame size it expects.
     pub fn capture_frame(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         loop {
             match self.capturer.frame() {
                 Ok(frame) => {
-                    return Ok(frame.to_vec());
+                    let expected_stride = self.width as usize * 4;
+                    let expected_size = expected_stride * self.height as usize;
+
+                    if frame.len() == expected_size {
+                        // No padding – fast path.
+                        return Ok(frame.to_vec());
+                    }
+
+                    // Row pitch is larger than width×4 → strip padding.
+                    let actual_stride = frame.len() / self.height as usize;
+                    let mut packed = Vec::with_capacity(expected_size);
+                    for row in 0..self.height as usize {
+                        let start = row * actual_stride;
+                        packed.extend_from_slice(&frame[start..start + expected_stride]);
+                    }
+                    return Ok(packed);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     // No new frame yet – yield briefly to avoid busy-waiting.
