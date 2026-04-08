@@ -14,9 +14,16 @@ scrap = "0.5"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+tower = { version = "0.5", features = ["util"] }
+http = "1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
     "winuser", "windef", "libloaderapi", "errhandlingapi",
-    "processthreadsapi", "impl-default"
+    "processthreadsapi", "impl-default", "winbase"
 ] }

@@ -1,0 +1,7 @@
+# Remote Desktop Server Configuration
+
+[auth]
+# Login credentials for the web interface.
+# Change these values before deploying!
+username = "admin"
+password = "changeme"

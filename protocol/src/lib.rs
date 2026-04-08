@@ -9,6 +9,7 @@
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
 pub const MSG_SERVER_INFO: u8 = 0x02;
 pub const MSG_CURSOR_INFO: u8 = 0x03;
+pub const MSG_MONITOR_LIST: u8 = 0x04;
 
 // Client → Server
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -16,6 +17,26 @@ pub const MSG_MOUSE_BUTTON: u8 = 0x11;
 pub const MSG_MOUSE_SCROLL: u8 = 0x12;
 pub const MSG_KEY_EVENT: u8 = 0x13;
 pub const MSG_CLIENT_READY: u8 = 0x14;
+pub const MSG_SELECT_MONITOR: u8 = 0x15;
+
+// --- Monitor info ---
+
+/// Information about a single display/monitor.
+#[derive(Debug, Clone)]
+pub struct MonitorInfo {
+    /// Zero-based monitor index.
+    pub index: u8,
+    /// Horizontal offset in the virtual desktop.
+    pub x: i16,
+    /// Vertical offset in the virtual desktop.
+    pub y: i16,
+    /// Width in pixels.
+    pub width: u16,
+    /// Height in pixels.
+    pub height: u16,
+    /// True if this is the primary monitor.
+    pub primary: bool,
+}
 
 // --- Server messages ---
 
@@ -42,6 +63,10 @@ pub enum ServerMessage {
         y: u16,
         visible: bool,
     },
+    /// List of available monitors.
+    MonitorList {
+        monitors: Vec<MonitorInfo>,
+    },
 }
 
 // --- Client messages ---
@@ -54,6 +79,8 @@ pub enum ClientMessage {
     /// `key_code` is a Windows Virtual-Key code (VK_*).
     KeyEvent { key_code: u16, pressed: bool },
     ClientReady,
+    /// Select a monitor by index.
+    SelectMonitor { index: u8 },
 }
 
 // --- Encoding ---
@@ -83,6 +110,21 @@ impl ServerMessage {
                 buf.extend_from_slice(&x.to_le_bytes());
                 buf.extend_from_slice(&y.to_le_bytes());
                 buf.push(u8::from(*visible));
+                buf
+            }
+            ServerMessage::MonitorList { monitors } => {
+                // [0x04] [count: u8] [for each: index u8, x i16, y i16, w u16, h u16, primary u8]
+                let mut buf = Vec::with_capacity(2 + monitors.len() * 10);
+                buf.push(MSG_MONITOR_LIST);
+                buf.push(monitors.len() as u8);
+                for m in monitors {
+                    buf.push(m.index);
+                    buf.extend_from_slice(&m.x.to_le_bytes());
+                    buf.extend_from_slice(&m.y.to_le_bytes());
+                    buf.extend_from_slice(&m.width.to_le_bytes());
+                    buf.extend_from_slice(&m.height.to_le_bytes());
+                    buf.push(u8::from(m.primary));
+                }
                 buf
             }
         }
@@ -125,6 +167,9 @@ impl ClientMessage {
             ClientMessage::ClientReady => {
                 vec![MSG_CLIENT_READY]
             }
+            ClientMessage::SelectMonitor { index } => {
+                vec![MSG_SELECT_MONITOR, *index]
+            }
         }
     }
 }
@@ -158,6 +203,25 @@ impl ServerMessage {
                 let y = u16::from_le_bytes(data[3..5].try_into().ok()?);
                 let visible = data[5] != 0;
                 Some(ServerMessage::CursorInfo { x, y, visible })
+            }
+            MSG_MONITOR_LIST if data.len() >= 2 => {
+                let count = data[1] as usize;
+                let expected_len = 2 + count * 10;
+                if data.len() < expected_len {
+                    return None;
+                }
+                let mut monitors = Vec::with_capacity(count);
+                for i in 0..count {
+                    let off = 2 + i * 10;
+                    let index = data[off];
+                    let x = i16::from_le_bytes(data[off + 1..off + 3].try_into().ok()?);
+                    let y = i16::from_le_bytes(data[off + 3..off + 5].try_into().ok()?);
+                    let width = u16::from_le_bytes(data[off + 5..off + 7].try_into().ok()?);
+                    let height = u16::from_le_bytes(data[off + 7..off + 9].try_into().ok()?);
+                    let primary = data[off + 9] != 0;
+                    monitors.push(MonitorInfo { index, x, y, width, height, primary });
+                }
+                Some(ServerMessage::MonitorList { monitors })
             }
             _ => None,
         }
@@ -193,6 +257,9 @@ impl ClientMessage {
                 Some(ClientMessage::KeyEvent { key_code, pressed })
             }
             MSG_CLIENT_READY => Some(ClientMessage::ClientReady),
+            MSG_SELECT_MONITOR if data.len() >= 2 => {
+                Some(ClientMessage::SelectMonitor { index: data[1] })
+            }
             _ => None,
         }
     }
@@ -274,5 +341,56 @@ mod tests {
     fn decode_truncated_returns_none() {
         assert!(ServerMessage::decode(&[MSG_SERVER_INFO, 0x00]).is_none());
         assert!(ClientMessage::decode(&[MSG_MOUSE_BUTTON, 0x00]).is_none());
+    }
+
+    #[test]
+    fn roundtrip_cursor_info() {
+        let msg = ServerMessage::CursorInfo { x: 100, y: 200, visible: true };
+        let encoded = msg.encode();
+        let decoded = ServerMessage::decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::CursorInfo { x, y, visible } => {
+                assert_eq!(x, 100);
+                assert_eq!(y, 200);
+                assert!(visible);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_monitor_list() {
+        let msg = ServerMessage::MonitorList {
+            monitors: vec![
+                MonitorInfo { index: 0, x: 0, y: 0, width: 1920, height: 1080, primary: true },
+                MonitorInfo { index: 1, x: 1920, y: 0, width: 2560, height: 1440, primary: false },
+            ],
+        };
+        let encoded = msg.encode();
+        let decoded = ServerMessage::decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::MonitorList { monitors } => {
+                assert_eq!(monitors.len(), 2);
+                assert_eq!(monitors[0].index, 0);
+                assert_eq!(monitors[0].width, 1920);
+                assert!(monitors[0].primary);
+                assert_eq!(monitors[1].index, 1);
+                assert_eq!(monitors[1].x, 1920);
+                assert_eq!(monitors[1].width, 2560);
+                assert!(!monitors[1].primary);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_select_monitor() {
+        let msg = ClientMessage::SelectMonitor { index: 2 };
+        let encoded = msg.encode();
+        let decoded = ClientMessage::decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::SelectMonitor { index } => assert_eq!(index, 2),
+            _ => panic!("wrong variant"),
+        }
     }
 }
