@@ -21,6 +21,7 @@ impl InputSimulator {
                 Self::key_event(key_code, pressed);
             }
             ClientMessage::ClientReady => { /* nothing to do */ }
+            ClientMessage::SelectMonitor { .. } => { /* handled by server */ }
         }
     }
 

@@ -20,6 +20,26 @@ impl ScreenCapture {
         Ok(Self { capturer, width: w, height: h })
     }
 
+    /// Open a specific display by index.
+    pub fn new_for_display(index: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let displays = Display::all()?;
+        if index >= displays.len() {
+            return Err(format!(
+                "Monitor index {} out of range (found {} monitors)",
+                index,
+                displays.len()
+            )
+            .into());
+        }
+        // Re-fetch to get ownership — Display::all() returns a Vec we can consume.
+        let display = displays.into_iter().nth(index).unwrap();
+        let w = display.width() as u32;
+        let h = display.height() as u32;
+        let capturer = Capturer::new(display)?;
+        log::info!("Screen capture initialized for monitor {}: {}×{}", index, w, h);
+        Ok(Self { capturer, width: w, height: h })
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -61,6 +81,41 @@ impl ScreenCapture {
                 }
                 Err(e) => return Err(e.into()),
             }
+        }
+    }
+}
+
+/// Enumerate all available displays and return monitor info.
+pub fn enumerate_monitors() -> Vec<protocol::MonitorInfo> {
+    match Display::all() {
+        Ok(displays) => {
+            let primary = Display::primary().ok();
+            let primary_dims = primary.as_ref().map(|d| (d.width(), d.height()));
+
+            displays
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    // scrap doesn't expose position, so we use index-based identification.
+                    // Primary detection is approximate.
+                    let is_primary = match &primary_dims {
+                        Some((pw, ph)) if i == 0 => d.width() == *pw && d.height() == *ph,
+                        _ => i == 0,
+                    };
+                    protocol::MonitorInfo {
+                        index: i as u8,
+                        x: 0,   // scrap doesn't expose monitor offset
+                        y: 0,
+                        width: d.width() as u16,
+                        height: d.height() as u16,
+                        primary: is_primary,
+                    }
+                })
+                .collect()
+        }
+        Err(e) => {
+            log::error!("Failed to enumerate displays: {e}");
+            Vec::new()
         }
     }
 }
