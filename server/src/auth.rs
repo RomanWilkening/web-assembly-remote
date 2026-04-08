@@ -196,9 +196,8 @@ pub async fn logout_handler(
 /// Build a session cookie string.
 /// The `Secure` flag is only set when the request arrived over HTTPS
 /// (directly or via a reverse proxy such as Apache with `X-Forwarded-Proto`).
-/// `SameSite=Lax` is used instead of `Strict` so that the cookie survives
-/// the POST → 303 redirect after login, even when an SSL-inspecting proxy
-/// (e.g. Netskope) is in the path.
+/// `SameSite=Lax` is used instead of `Strict` for broader compatibility
+/// with SSL-inspecting proxies (e.g. Netskope).
 fn build_session_cookie(token: &str, max_age: u64, secure: bool) -> String {
     let mut cookie = format!(
         "session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
