@@ -2,8 +2,9 @@ use wasm_bindgen::prelude::*;
 
 // Re-export protocol constants so JS can reference them if needed.
 pub use protocol::{
-    MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON,
-    MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL, MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
+    MSG_AUDIO_DATA, MSG_AUDIO_DEVICE_LIST, MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT,
+    MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL, MSG_SELECT_AUDIO,
+    MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,11 @@ pub fn encode_key_event(key_code: u16, pressed: bool) -> Vec<u8> {
 #[wasm_bindgen]
 pub fn encode_select_monitor(index: u8) -> Vec<u8> {
     protocol::ClientMessage::SelectMonitor { index }.encode()
+}
+
+#[wasm_bindgen]
+pub fn encode_select_audio(index: u8) -> Vec<u8> {
+    protocol::ClientMessage::SelectAudio { index }.encode()
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +212,72 @@ pub fn monitor_info_primary(data: &[u8], i: u8) -> bool {
         return false;
     }
     data[off + 9] != 0
+}
+
+// ---------------------------------------------------------------------------
+// Audio device list decode helpers
+// ---------------------------------------------------------------------------
+
+/// For an AudioDeviceList message, extract the number of devices.
+#[wasm_bindgen]
+pub fn audio_device_list_count(data: &[u8]) -> u8 {
+    if data.len() < 2 || data[0] != MSG_AUDIO_DEVICE_LIST {
+        return 0;
+    }
+    data[1]
+}
+
+/// For an AudioDeviceList message, extract a device's index.
+#[wasm_bindgen]
+pub fn audio_device_index(data: &[u8], i: u8) -> u8 {
+    if data.len() < 2 || data[0] != MSG_AUDIO_DEVICE_LIST {
+        return 0;
+    }
+    let mut pos: usize = 2;
+    for n in 0..=i {
+        if pos + 3 > data.len() {
+            return 0;
+        }
+        let idx = data[pos];
+        let name_len = u16::from_le_bytes(
+            data[pos + 1..pos + 3].try_into().unwrap_or_default(),
+        ) as usize;
+        pos += 3;
+        if pos + name_len > data.len() {
+            return 0;
+        }
+        if n == i {
+            return idx;
+        }
+        pos += name_len;
+    }
+    0
+}
+
+/// For an AudioDeviceList message, extract a device's name as a string.
+#[wasm_bindgen]
+pub fn audio_device_name(data: &[u8], i: u8) -> String {
+    if data.len() < 2 || data[0] != MSG_AUDIO_DEVICE_LIST {
+        return String::new();
+    }
+    let mut pos: usize = 2;
+    for n in 0..=i {
+        if pos + 3 > data.len() {
+            return String::new();
+        }
+        let name_len = u16::from_le_bytes(
+            data[pos + 1..pos + 3].try_into().unwrap_or_default(),
+        ) as usize;
+        pos += 3;
+        if pos + name_len > data.len() {
+            return String::new();
+        }
+        if n == i {
+            return String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+        }
+        pos += name_len;
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------

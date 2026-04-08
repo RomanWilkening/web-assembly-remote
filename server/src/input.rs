@@ -50,6 +50,7 @@ impl InputSimulator {
             }
             ClientMessage::ClientReady => { /* nothing to do */ }
             ClientMessage::SelectMonitor { .. } => { /* handled by server */ }
+            ClientMessage::SelectAudio { .. } => { /* handled by server */ }
         }
     }
 

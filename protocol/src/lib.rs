@@ -11,6 +11,7 @@ pub const MSG_SERVER_INFO: u8 = 0x02;
 pub const MSG_CURSOR_INFO: u8 = 0x03;
 pub const MSG_MONITOR_LIST: u8 = 0x04;
 pub const MSG_AUDIO_DATA: u8 = 0x05;
+pub const MSG_AUDIO_DEVICE_LIST: u8 = 0x06;
 
 // Client → Server
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -19,6 +20,7 @@ pub const MSG_MOUSE_SCROLL: u8 = 0x12;
 pub const MSG_KEY_EVENT: u8 = 0x13;
 pub const MSG_CLIENT_READY: u8 = 0x14;
 pub const MSG_SELECT_MONITOR: u8 = 0x15;
+pub const MSG_SELECT_AUDIO: u8 = 0x16;
 
 // --- Monitor info ---
 
@@ -37,6 +39,17 @@ pub struct MonitorInfo {
     pub height: u16,
     /// True if this is the primary monitor.
     pub primary: bool,
+}
+
+// --- Audio device info ---
+
+/// Information about an available audio capture device.
+#[derive(Debug, Clone)]
+pub struct AudioDeviceInfo {
+    /// Zero-based device index.
+    pub index: u8,
+    /// Human-readable device name (e.g. "Stereo Mix (Realtek …)").
+    pub name: String,
 }
 
 // --- Server messages ---
@@ -72,6 +85,10 @@ pub enum ServerMessage {
     AudioData {
         data: Vec<u8>,
     },
+    /// List of available audio capture devices.
+    AudioDeviceList {
+        devices: Vec<AudioDeviceInfo>,
+    },
 }
 
 // --- Client messages ---
@@ -86,6 +103,8 @@ pub enum ClientMessage {
     ClientReady,
     /// Select a monitor by index.
     SelectMonitor { index: u8 },
+    /// Select an audio capture device by index, or 0xFF to disable audio.
+    SelectAudio { index: u8 },
 }
 
 // --- Encoding ---
@@ -138,6 +157,19 @@ impl ServerMessage {
                 buf.extend_from_slice(data);
                 buf
             }
+            ServerMessage::AudioDeviceList { devices } => {
+                // [0x06] [count: u8] [for each: index u8, name_len u16, name bytes...]
+                let mut buf = Vec::with_capacity(2 + devices.len() * 32);
+                buf.push(MSG_AUDIO_DEVICE_LIST);
+                buf.push(devices.len() as u8);
+                for d in devices {
+                    buf.push(d.index);
+                    let name_bytes = d.name.as_bytes();
+                    buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(name_bytes);
+                }
+                buf
+            }
         }
     }
 }
@@ -180,6 +212,9 @@ impl ClientMessage {
             }
             ClientMessage::SelectMonitor { index } => {
                 vec![MSG_SELECT_MONITOR, *index]
+            }
+            ClientMessage::SelectAudio { index } => {
+                vec![MSG_SELECT_AUDIO, *index]
             }
         }
     }
@@ -237,6 +272,28 @@ impl ServerMessage {
             MSG_AUDIO_DATA if data.len() > 1 => {
                 Some(ServerMessage::AudioData { data: data[1..].to_vec() })
             }
+            MSG_AUDIO_DEVICE_LIST if data.len() >= 2 => {
+                let count = data[1] as usize;
+                let mut devices = Vec::with_capacity(count);
+                let mut pos = 2;
+                for _ in 0..count {
+                    if pos + 3 > data.len() {
+                        return None;
+                    }
+                    let index = data[pos];
+                    let name_len = u16::from_le_bytes(
+                        data[pos + 1..pos + 3].try_into().ok()?,
+                    ) as usize;
+                    pos += 3;
+                    if pos + name_len > data.len() {
+                        return None;
+                    }
+                    let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+                    pos += name_len;
+                    devices.push(AudioDeviceInfo { index, name });
+                }
+                Some(ServerMessage::AudioDeviceList { devices })
+            }
             _ => None,
         }
     }
@@ -273,6 +330,9 @@ impl ClientMessage {
             MSG_CLIENT_READY => Some(ClientMessage::ClientReady),
             MSG_SELECT_MONITOR if data.len() >= 2 => {
                 Some(ClientMessage::SelectMonitor { index: data[1] })
+            }
+            MSG_SELECT_AUDIO if data.len() >= 2 => {
+                Some(ClientMessage::SelectAudio { index: data[1] })
             }
             _ => None,
         }
@@ -419,6 +479,63 @@ mod tests {
                 assert_eq!(data.len(), 7680);
                 assert_eq!(data, pcm);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_audio_device_list() {
+        let msg = ServerMessage::AudioDeviceList {
+            devices: vec![
+                AudioDeviceInfo { index: 0, name: "Stereo Mix (Realtek)".into() },
+                AudioDeviceInfo { index: 1, name: "Microphone (Realtek)".into() },
+            ],
+        };
+        let encoded = msg.encode();
+        let decoded = ServerMessage::decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::AudioDeviceList { devices } => {
+                assert_eq!(devices.len(), 2);
+                assert_eq!(devices[0].index, 0);
+                assert_eq!(devices[0].name, "Stereo Mix (Realtek)");
+                assert_eq!(devices[1].index, 1);
+                assert_eq!(devices[1].name, "Microphone (Realtek)");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_audio_device_list_empty() {
+        let msg = ServerMessage::AudioDeviceList { devices: vec![] };
+        let encoded = msg.encode();
+        let decoded = ServerMessage::decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::AudioDeviceList { devices } => {
+                assert_eq!(devices.len(), 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_select_audio() {
+        let msg = ClientMessage::SelectAudio { index: 3 };
+        let encoded = msg.encode();
+        let decoded = ClientMessage::decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::SelectAudio { index } => assert_eq!(index, 3),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_select_audio_disable() {
+        let msg = ClientMessage::SelectAudio { index: 0xFF };
+        let encoded = msg.encode();
+        let decoded = ClientMessage::decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::SelectAudio { index } => assert_eq!(index, 0xFF),
             _ => panic!("wrong variant"),
         }
     }
