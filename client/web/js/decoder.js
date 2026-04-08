@@ -53,7 +53,12 @@ export class H264Decoder {
 
     this._decoder = new VideoDecoder({
       output: (frame) => this._onFrame(frame),
-      error: (e) => console.error('VideoDecoder error:', e),
+      error: (e) => {
+        console.error('VideoDecoder error:', e);
+        // Mark as unconfigured so the next key-frame triggers
+        // re-initialisation instead of feeding a closed decoder.
+        this._configured = false;
+      },
     });
 
     this._decoder.configure({
@@ -73,14 +78,22 @@ export class H264Decoder {
    * @param {number} timestampUs – microsecond timestamp from server
    */
   decode(annexB, isKeyFrame, timestampUs) {
+    // If the decoder was closed (e.g. after an error), reset and wait
+    // for the next key-frame to reconfigure.
+    if (this._decoder && this._decoder.state === 'closed') {
+      this._configured = false;
+    }
+
     if (!this._configured) {
       if (!isKeyFrame) return; // need a key-frame first
       this._configureFromKeyFrame(annexB);
       if (!this._configured) return;
     }
 
-    // Convert Annex-B → AVC (length-prefixed NAL units)
-    const avcData = annexBToAvc(annexB);
+    // Convert Annex-B → AVC (length-prefixed NAL units),
+    // stripping parameter sets (SPS/PPS) since they are already
+    // provided via the avcC description during configure().
+    const avcData = annexBToAvc(annexB, /* stripParamSets */ true);
 
     const chunk = new EncodedVideoChunk({
       type: isKeyFrame ? 'key' : 'delta',
@@ -88,7 +101,12 @@ export class H264Decoder {
       data: avcData,
     });
 
-    this._decoder.decode(chunk);
+    try {
+      this._decoder.decode(chunk);
+    } catch (e) {
+      console.error('decode() threw:', e);
+      this._configured = false;
+    }
   }
 
   close() {
@@ -158,23 +176,35 @@ function parseAnnexB(data) {
 /**
  * Convert Annex-B data to AVC format (4-byte big-endian length prefix
  * per NAL unit, start codes removed).
+ *
  * @param {Uint8Array} annexB
+ * @param {boolean} [stripParamSets=false] – When true, SPS (7) and
+ *   PPS (8) NALs are omitted because they are already provided via
+ *   the avcC description record.
  * @returns {Uint8Array}
  */
-function annexBToAvc(annexB) {
+function annexBToAvc(annexB, stripParamSets = false) {
   const nals = parseAnnexB(annexB);
+
+  /** Should this NAL type be excluded from the output? */
+  const skip = (nalType) => {
+    if (nalType === 9) return true; // AUD – not needed by decoder
+    if (stripParamSets && (nalType === 7 || nalType === 8)) return true;
+    return false;
+  };
 
   let totalSize = 0;
   for (const nal of nals) {
-    // Skip AUD NAL units (type 9) – decoder doesn't need them
-    if ((nal[0] & 0x1f) === 9) continue;
+    if (nal.length === 0) continue;
+    if (skip(nal[0] & 0x1f)) continue;
     totalSize += 4 + nal.length;
   }
 
   const out = new Uint8Array(totalSize);
   let offset = 0;
   for (const nal of nals) {
-    if ((nal[0] & 0x1f) === 9) continue;
+    if (nal.length === 0) continue;
+    if (skip(nal[0] & 0x1f)) continue;
     // 4-byte big-endian length
     out[offset]     = (nal.length >>> 24) & 0xff;
     out[offset + 1] = (nal.length >>> 16) & 0xff;

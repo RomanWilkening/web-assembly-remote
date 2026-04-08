@@ -1,4 +1,4 @@
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, Command, Stdio};
 use tokio::sync::mpsc;
 
@@ -103,6 +103,24 @@ impl FfmpegEncoder {
         );
 
         let stdout = process.stdout.take().expect("stdout must be piped");
+        let stderr = process.stderr.take().expect("stderr must be piped");
+
+        // Background thread: log FFmpeg stderr so encoder errors are visible.
+        std::thread::Builder::new()
+            .name("ffmpeg-stderr".into())
+            .spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if !l.is_empty() => log::warn!("FFmpeg: {l}"),
+                        Err(e) => {
+                            log::debug!("FFmpeg stderr read error: {e}");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })?;
 
         // Background reader thread: reads H.264 byte-stream, splits on
         // Access Unit Delimiters, and pushes frames into the channel.
@@ -180,7 +198,7 @@ impl AuDetector {
         let mut search = 0;
         let mut prev_aud: Option<usize> = None;
 
-        while search + 4 < self.buf.len() {
+        while search + 3 < self.buf.len() {
             if let Some(aud_pos) = self.find_aud(search) {
                 if let Some(start) = prev_aud {
                     let au_data = self.buf[start..aud_pos].to_vec();
@@ -208,15 +226,15 @@ impl AuDetector {
     fn find_aud(&self, from: usize) -> Option<usize> {
         let d = &self.buf;
         let mut i = from;
-        while i + 4 < d.len() {
+        while i + 3 < d.len() {
             if d[i] == 0 && d[i + 1] == 0 {
                 // 4-byte start-code
-                if d[i + 2] == 0 && i + 5 <= d.len() && d[i + 3] == 1 && (d[i + 4] & 0x1F) == 9
+                if i + 4 < d.len() && d[i + 2] == 0 && d[i + 3] == 1 && (d[i + 4] & 0x1F) == 9
                 {
                     return Some(i);
                 }
                 // 3-byte start-code
-                if d[i + 2] == 1 && i + 4 <= d.len() && (d[i + 3] & 0x1F) == 9 {
+                if d[i + 2] == 1 && (d[i + 3] & 0x1F) == 9 {
                     return Some(i);
                 }
             }
