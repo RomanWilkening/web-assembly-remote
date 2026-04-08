@@ -132,6 +132,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 
     // ── 2. Start capture on selected monitor ──────────────────
+
+    // Look up the selected monitor's geometry (virtual-desktop position).
+    let monitor_info = monitors.iter().find(|m| m.index as usize == selected_monitor);
+
     let screen_dims = {
         let monitor_idx = selected_monitor;
         tokio::task::spawn_blocking(move || {
@@ -155,17 +159,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     };
 
+    // Monitor position in the virtual desktop (from enumeration).
+    let mon_x = monitor_info.map(|m| m.x as i32).unwrap_or(0);
+    let mon_y = monitor_info.map(|m| m.y as i32).unwrap_or(0);
+
     let info_msg = protocol::ServerMessage::ServerInfo {
         width: screen_w,
         height: screen_h,
         fps: state.fps as u8,
     };
     log::info!(
-        "Sending ServerInfo: {}×{} @ {} fps (monitor {})",
+        "Sending ServerInfo: {}×{} @ {} fps (monitor {} at {}, {})",
         screen_w,
         screen_h,
         state.fps,
-        selected_monitor
+        selected_monitor,
+        mon_x,
+        mon_y
     );
     if ws_tx
         .send(Message::Binary(info_msg.encode().into()))
@@ -191,14 +201,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let monitor_idx = selected_monitor;
 
     // ── 3. Spawn the capture + encode pipeline (blocking thread) ──
+    let cap_mon_x = mon_x;
+    let cap_mon_y = mon_y;
+    let cap_mon_w = screen_w as u32;
+    let cap_mon_h = screen_h as u32;
     let capture_handle = tokio::task::spawn_blocking(move || {
-        if let Err(e) = capture_loop(fps, quality, &encoder_name, frame_tx, cursor_tx, monitor_idx)
-        {
+        if let Err(e) = capture_loop(
+            fps,
+            quality,
+            &encoder_name,
+            frame_tx,
+            cursor_tx,
+            monitor_idx,
+            cap_mon_x,
+            cap_mon_y,
+            cap_mon_w,
+            cap_mon_h,
+        ) {
             log::error!("Capture loop error: {e}");
         }
     });
 
     // ── 4. Spawn the input handler (blocking thread) ──
+    let input_sim = InputSimulator::new(mon_x, mon_y, screen_w as u32, screen_h as u32);
     let input_handle = tokio::task::spawn_blocking(move || {
         while let Some(data) = input_rx.blocking_recv() {
             if let Some(msg) = protocol::ClientMessage::decode(&data) {
@@ -208,7 +233,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Client should disconnect and reconnect with new selection.
                         log::info!("Monitor switch requested – client should reconnect");
                     }
-                    other => InputSimulator::handle(other),
+                    other => input_sim.handle(other),
                 }
             }
         }
@@ -261,6 +286,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
 /// Main capture → encode loop. Runs on a dedicated OS thread.
 /// Also sends cursor position updates alongside video frames.
+///
+/// Cursor coordinates are converted from absolute virtual-desktop
+/// space to positions relative to the captured monitor so the client
+/// can overlay them correctly.
 fn capture_loop(
     fps: u32,
     quality: u8,
@@ -268,6 +297,10 @@ fn capture_loop(
     frame_tx: mpsc::Sender<EncodedFrame>,
     cursor_tx: mpsc::Sender<protocol::ServerMessage>,
     monitor_index: usize,
+    monitor_x: i32,
+    monitor_y: i32,
+    monitor_w: u32,
+    monitor_h: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut capture = ScreenCapture::new_for_display(monitor_index)
         .or_else(|_| ScreenCapture::new())?;
@@ -275,11 +308,13 @@ fn capture_loop(
     let h = capture.height();
 
     log::info!(
-        "Capture initialized: {}×{} @ {} fps (monitor {})",
+        "Capture initialized: {}×{} @ {} fps (monitor {} at {}, {})",
         w,
         h,
         fps,
-        monitor_index
+        monitor_index,
+        monitor_x,
+        monitor_y
     );
 
     let mut encoder = FfmpegEncoder::new(w, h, fps, quality, encoder_name, frame_tx)?;
@@ -300,13 +335,25 @@ fn capture_loop(
         encoder.send_frame(&bgra)?;
 
         // Send cursor position (only when it changes or every ~10 frames).
-        let (cx, cy, visible) = cursor::get_cursor_position();
-        if (cx, cy, visible) != last_cursor || frame_no % 10 == 0 {
-            last_cursor = (cx, cy, visible);
+        let (abs_cx, abs_cy, visible) = cursor::get_cursor_position();
+
+        // Check whether the cursor is inside the captured monitor.
+        let on_monitor = (abs_cx as i32) >= monitor_x
+            && (abs_cx as i32) < monitor_x + monitor_w as i32
+            && (abs_cy as i32) >= monitor_y
+            && (abs_cy as i32) < monitor_y + monitor_h as i32;
+
+        // Convert to monitor-relative coordinates, clamped to [0, dimension).
+        let rel_cx = ((abs_cx as i32 - monitor_x).max(0) as u32).min(monitor_w.saturating_sub(1)) as u16;
+        let rel_cy = ((abs_cy as i32 - monitor_y).max(0) as u32).min(monitor_h.saturating_sub(1)) as u16;
+        let show = visible && on_monitor;
+
+        if (rel_cx, rel_cy, show) != last_cursor || frame_no % 10 == 0 {
+            last_cursor = (rel_cx, rel_cy, show);
             let cursor_msg = protocol::ServerMessage::CursorInfo {
-                x: cx,
-                y: cy,
-                visible,
+                x: rel_cx,
+                y: rel_cy,
+                visible: show,
             };
             let _ = cursor_tx.try_send(cursor_msg);
         }
