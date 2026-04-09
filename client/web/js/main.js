@@ -372,6 +372,11 @@ async function main() {
   // ── 12. WebSocket connect ────────────────────────────────────
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    // The token is passed as a query parameter because the browser
+    // WebSocket API does not support custom headers.  The connection
+    // is over TLS (wss://) so the URL is encrypted in transit.
+    // The URL is constructed in JavaScript (not browser navigation),
+    // so it does not appear in browser history.
     const wsUrl = `${proto}://${location.host}/ws?token=${encodeURIComponent(sessionToken)}`;
     statusEl.textContent = 'Connecting…';
 

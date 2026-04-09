@@ -81,6 +81,40 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
+/// Simple percent-decode for query parameter values.
+/// The session token is hex-only (`[0-9a-f]`), so percent-encoding is
+/// unlikely in practice, but we decode defensively in case the client
+/// or an intermediary encodes any characters.
+fn percent_decode(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                hex_nibble(bytes[i + 1]),
+                hex_nibble(bytes[i + 2]),
+            ) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Extract the session token from the request.
 ///
 /// Checks (in order):
@@ -122,9 +156,10 @@ fn extract_session_token(req: &Request<Body>) -> Option<String> {
     if let Some(query) = req.uri().query() {
         for param in query.split('&') {
             if let Some(value) = param.strip_prefix("token=") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
+                // URL-decode in case the client percent-encoded the value.
+                let decoded = percent_decode(value.trim());
+                if !decoded.is_empty() {
+                    return Some(decoded);
                 }
             }
         }
