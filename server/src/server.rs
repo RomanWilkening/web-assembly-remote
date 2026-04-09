@@ -347,7 +347,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // frame forces the proxy to flush its write pipeline.
         let mut ping_interval = time::interval(Duration::from_secs(5));
         ping_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        // Skip the first immediate tick.
+        // Consume the immediate first tick so the first ping fires after 5 s.
         ping_interval.tick().await;
 
         loop {
