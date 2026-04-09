@@ -117,12 +117,45 @@ async function main() {
   /** @type {WebSocket|null} */
   let ws = null;
 
+  // ── Stall detection ─────────────────────────────────────────
+  // SSL-inspecting proxies (e.g. Netskope) may buffer WebSocket data
+  // causing frames to stop arriving.  If no video frame arrives for
+  // STALL_TIMEOUT_MS while the socket is connected, we reconnect.
+  const STALL_TIMEOUT_MS = 5000;
+  let lastFrameTime = 0;
+  let stallTimerId = 0;
+
   /** Send binary data over the WebSocket (if connected). */
   const send = (data) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(data);
     }
   };
+
+  /** Reset the stall timer – call whenever a video frame is received. */
+  function resetStallTimer() {
+    lastFrameTime = Date.now();
+    clearTimeout(stallTimerId);
+    if (streaming && ws && ws.readyState === WebSocket.OPEN) {
+      stallTimerId = setTimeout(onStall, STALL_TIMEOUT_MS);
+    }
+  }
+
+  /** Called when no video frame arrives within STALL_TIMEOUT_MS. */
+  function onStall() {
+    if (!streaming || !ws) return;
+    console.warn(
+      `No video frame received for ${STALL_TIMEOUT_MS} ms – reconnecting (proxy stall workaround)`
+    );
+    // Tear down and reconnect.
+    if (ws) {
+      ws.close();
+      ws = null;
+    }
+    decoder.close();
+    renderer.stop();
+    connect();
+  }
 
   // ── 1. Load WASM ─────────────────────────────────────────────
   statusEl.textContent = 'Loading WASM module…';
@@ -281,6 +314,7 @@ async function main() {
 
   function stopStream() {
     streaming = false;
+    clearTimeout(stallTimerId);
     if (ws) {
       ws.close();
       ws = null;
@@ -387,9 +421,13 @@ async function main() {
       statusEl.textContent = 'Connected – waiting for first frame…';
       // Always tell the server which monitor to capture.
       send(wasm.encode_select_monitor(currentMonitorIndex));
+      // Start the stall detector – if no video frame arrives within the
+      // timeout the connection will be recycled automatically.
+      resetStallTimer();
     });
 
     ws.addEventListener('close', () => {
+      clearTimeout(stallTimerId);
       if (streaming) {
         statusEl.textContent = 'Disconnected';
         decoder.close();
@@ -491,6 +529,9 @@ async function main() {
           const isKey     = wasm.video_frame_is_keyframe(data);
           const offset    = wasm.video_frame_data_offset();
           const h264Data  = data.subarray(offset);
+
+          // Reset the stall-detection timer on every received frame.
+          resetStallTimer();
 
           // Measure one-way latency (approximate, requires synchronised clocks).
           const nowUs = performance.now() * 1000 + performance.timeOrigin * 1000;

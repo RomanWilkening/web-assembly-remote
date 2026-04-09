@@ -11,6 +11,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use std::{net::SocketAddr, time::Instant};
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 use tower_http::services::ServeDir;
 
 use crate::auth::{self, AuthState};
@@ -339,8 +340,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    // ── 5. WebSocket sender task (video frames + cursor info + audio) ──
+    // ── 5. WebSocket sender task (video frames + cursor info + audio + ping) ──
     let send_handle = tokio::spawn(async move {
+        // Periodic WebSocket pings keep SSL-inspecting proxies (e.g.
+        // Netskope) from buffering data indefinitely.  The small control
+        // frame forces the proxy to flush its write pipeline.
+        let mut ping_interval = time::interval(Duration::from_secs(5));
+        ping_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick so the first ping fires after 5 s.
+        ping_interval.tick().await;
+
         loop {
             tokio::select! {
                 Some(frame) = frame_rx.recv() => {
@@ -365,6 +374,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let msg = protocol::ServerMessage::AudioData { data: audio_data };
                     let bin = msg.encode();
                     if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
                         break;
                     }
                 }
