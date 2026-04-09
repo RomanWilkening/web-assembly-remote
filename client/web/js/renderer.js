@@ -54,10 +54,15 @@ export class Renderer {
 
   /** @private */
   _render() {
-    if (this._pendingFrame) {
-      this._ctx.drawImage(this._pendingFrame, 0, 0, this._canvas.width, this._canvas.height);
-      this._pendingFrame.close();
+    const frame = this._pendingFrame;
+    if (frame) {
       this._pendingFrame = null;
+      try {
+        this._ctx.drawImage(frame, 0, 0, this._canvas.width, this._canvas.height);
+      } catch (e) {
+        console.warn('drawImage failed:', e);
+      }
+      frame.close();
     }
     if (this._running) {
       this._scheduleRender();

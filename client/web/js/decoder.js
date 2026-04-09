@@ -134,6 +134,14 @@ export class H264Decoder {
       if (!this._configured) return;
     }
 
+    // When frames arrive in bursts (common with SSL-inspecting proxies
+    // like Netskope that buffer data), the decoder queue can grow
+    // unbounded. Drop non-key delta frames to prevent overload;
+    // always accept key-frames so the decoder can resynchronise.
+    if (!isKeyFrame && this._decoder.decodeQueueSize > 3) {
+      return;
+    }
+
     // Pass raw Annex-B data directly – no conversion needed.
     // Chrome decodes Annex-B natively when no avcC description
     // was provided during configure().
