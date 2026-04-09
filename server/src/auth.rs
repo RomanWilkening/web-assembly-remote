@@ -81,18 +81,90 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Extract session token from cookies.
+/// Simple percent-decode for query parameter values.
+/// The session token is hex-only (`[0-9a-f]`), so percent-encoding is
+/// unlikely in practice, but we decode defensively in case the client
+/// or an intermediary encodes any characters.
+fn percent_decode(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                hex_nibble(bytes[i + 1]),
+                hex_nibble(bytes[i + 2]),
+            ) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Extract the session token from the request.
+///
+/// Checks (in order):
+/// 1. `Authorization: Bearer <token>` header – the primary mechanism used
+///    by the SPA client.  Immune to cookie-stripping by SSL-inspecting
+///    proxies (e.g. Netskope).
+/// 2. `Cookie: session=<token>` – backward-compatible fallback.
+/// 3. `token` query parameter – used for WebSocket upgrades where custom
+///    headers cannot be set by the browser.
 fn extract_session_token(req: &Request<Body>) -> Option<String> {
-    let cookie_header = req.headers().get(header::COOKIE)?.to_str().ok()?;
-    for cookie in cookie_header.split(';') {
-        let cookie = cookie.trim();
-        if let Some(value) = cookie.strip_prefix("session=") {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
+    // 1. Authorization: Bearer <token>
+    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                let token = token.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
             }
         }
     }
+
+    // 2. Cookie: session=<token>
+    if let Some(cookie_header) = req.headers().get(header::COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for cookie in cookie_str.split(';') {
+                let cookie = cookie.trim();
+                if let Some(value) = cookie.strip_prefix("session=") {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Query parameter: ?token=<token>
+    if let Some(query) = req.uri().query() {
+        for param in query.split('&') {
+            if let Some(value) = param.strip_prefix("token=") {
+                // URL-decode in case the client percent-encoded the value.
+                let decoded = percent_decode(value.trim());
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -113,8 +185,13 @@ pub async fn auth_middleware(
 ) -> Response {
     let path = req.uri().path().to_string();
 
-    // Allow unauthenticated access to the login page and login API.
-    if path == "/login" || path == "/api/login" {
+    // Allow unauthenticated access to the login page, login API, and the
+    // application shell.  The root page (`/`) is just the HTML shell – the
+    // client-side JavaScript verifies the session token via `/api/session`
+    // and redirects to `/login` when it is missing or invalid.  Serving the
+    // shell without a cookie avoids the infinite-redirect problem caused by
+    // SSL-inspecting proxies (e.g. Netskope) that strip cookies.
+    if path == "/login" || path == "/api/login" || path == "/" || path == "/index.html" {
         return next.run(req).await;
     }
 
@@ -130,7 +207,8 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Check for valid session cookie.
+    // Check for a valid session token (Authorization header, cookie, or
+    // query parameter).
     if let Some(token) = extract_session_token(&req) {
         if auth.is_valid_session(&token) {
             return next.run(req).await;
@@ -221,15 +299,9 @@ pub async fn logout_handler(
         auth.logout(&token);
     }
 
+    // Expire the cookie (for clients that still use cookies).
     let cookie = build_session_cookie("", 0, is_https);
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, "/login".to_string()),
-        ],
-    )
-        .into_response()
+    (StatusCode::OK, [(header::SET_COOKIE, cookie)]).into_response()
 }
 
 // --- Cookie helpers ---

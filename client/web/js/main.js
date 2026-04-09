@@ -128,17 +128,25 @@ async function main() {
   statusEl.textContent = 'Loading WASM module…';
 
   // Verify that the session is still valid before doing anything.
-  // When a proxy strips the session cookie from sub-resource requests the
-  // module scripts load fine (they are served without auth), but the
-  // WebSocket will be rejected with 401.  Checking here gives a clean
-  // redirect to /login rather than a cryptic "Connection error".
+  // The token is stored in sessionStorage by the login page and sent via
+  // the Authorization header – no cookies required.
+  const sessionToken = sessionStorage.getItem('session_token');
+  if (!sessionToken) {
+    window.location.href = '/login';
+    return;
+  }
+
   try {
-    const sessionRes = await fetch('/api/session', { credentials: 'same-origin' });
+    const sessionRes = await fetch('/api/session', {
+      headers: { 'Authorization': 'Bearer ' + sessionToken },
+    });
     if (!sessionRes.ok) {
+      sessionStorage.removeItem('session_token');
       window.location.href = '/login';
       return;
     }
   } catch (e) {
+    sessionStorage.removeItem('session_token');
     window.location.href = '/login';
     return;
   }
@@ -333,8 +341,12 @@ async function main() {
   // ── 10. Logout ───────────────────────────────────────────────
   btnLogout.addEventListener('click', () => {
     stopStream();
-    // POST to /api/logout then redirect
-    fetch('/api/logout', { method: 'POST' }).finally(() => {
+    // POST to /api/logout with Bearer token, then redirect.
+    fetch('/api/logout', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + sessionToken },
+    }).finally(() => {
+      sessionStorage.removeItem('session_token');
       window.location.href = '/login';
     });
   });
@@ -360,8 +372,13 @@ async function main() {
   // ── 12. WebSocket connect ────────────────────────────────────
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${proto}://${location.host}/ws`;
-    statusEl.textContent = `Connecting to ${wsUrl}…`;
+    // The token is passed as a query parameter because the browser
+    // WebSocket API does not support custom headers.  The connection
+    // is over TLS (wss://) so the URL is encrypted in transit.
+    // The URL is constructed in JavaScript (not browser navigation),
+    // so it does not appear in browser history.
+    const wsUrl = `${proto}://${location.host}/ws?token=${encodeURIComponent(sessionToken)}`;
+    statusEl.textContent = 'Connecting…';
 
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
