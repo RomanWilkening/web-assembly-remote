@@ -78,14 +78,13 @@
           credentials: 'same-origin'
         });
         if (res.ok) {
-          // Read the session token from the response body.
-          // Even when the server sends Set-Cookie, SSL-inspecting proxies
-          // (e.g. Netskope) may strip that header before the browser sees it.
-          // Setting the cookie from JavaScript guarantees the session persists.
+          // Store the session token in sessionStorage.  This is the primary
+          // authentication mechanism – subsequent requests use the
+          // Authorization: Bearer header, which is immune to cookie-stripping
+          // by SSL-inspecting proxies (e.g. Netskope).
           var token = (await res.text()).trim();
           if (token) {
-            var secure = location.protocol === 'https:' ? '; Secure' : '';
-            document.cookie = 'session=' + token + '; path=/; SameSite=Lax; max-age=86400' + secure;
+            sessionStorage.setItem('session_token', token);
           }
           window.location.href = '/';
         } else {
