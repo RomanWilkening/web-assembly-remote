@@ -200,7 +200,12 @@ pub async fn login_handler(
     match auth.login(&form.username, &form.password) {
         Some(token) => {
             let cookie = build_session_cookie(&token, 86400, is_https);
-            (StatusCode::OK, [(header::SET_COOKIE, cookie)]).into_response()
+            // Return the token in the response body as well as the
+            // Set-Cookie header.  SSL-inspecting proxies (e.g. Netskope)
+            // may strip Set-Cookie from the response before it reaches the
+            // browser.  The client JavaScript uses the body value to set the
+            // cookie via `document.cookie` as a fallback.
+            (StatusCode::OK, [(header::SET_COOKIE, cookie)], token).into_response()
         }
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
