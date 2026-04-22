@@ -3,8 +3,9 @@ use wasm_bindgen::prelude::*;
 // Re-export protocol constants so JS can reference them if needed.
 pub use protocol::{
     MSG_AUDIO_DATA, MSG_AUDIO_DEVICE_LIST, MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT,
-    MSG_KEY_UNICODE, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL,
-    MSG_SELECT_AUDIO, MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
+    MSG_KEY_SCANCODE, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL,
+    MSG_SELECT_AUDIO, MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_SET_KEYBOARD_LAYOUT,
+    MSG_VIDEO_FRAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,13 +37,21 @@ pub fn encode_key_event(key_code: u16, pressed: bool) -> Vec<u8> {
     protocol::ClientMessage::KeyEvent { key_code, pressed }.encode()
 }
 
-/// Encode a Unicode character injection event.
-/// `codepoint` is a Unicode scalar value (0..=0x10FFFF). Used for plain
-/// typing so the remote receives exactly the character the user typed
-/// regardless of the keyboard layout active on the remote machine.
+/// Encode a hardware-scancode key event (Parsec-style forwarding).
+/// `scancode` is a PS/2 Set 1 scancode; `extended` corresponds to the
+/// `0xE0` prefix (cursor keys, right-hand modifiers, numpad enter,
+/// etc.). The remote interprets the scancode through its currently
+/// active keyboard layout.
 #[wasm_bindgen]
-pub fn encode_key_unicode(codepoint: u32, pressed: bool) -> Vec<u8> {
-    protocol::ClientMessage::KeyUnicode { codepoint, pressed }.encode()
+pub fn encode_key_scancode(scancode: u16, extended: bool, pressed: bool) -> Vec<u8> {
+    protocol::ClientMessage::KeyScancode { scancode, extended, pressed }.encode()
+}
+
+/// Switch the active keyboard layout on the remote. `klid` is a
+/// Windows Keyboard-Layout-ID, e.g. `0x0000_0407` for de-DE.
+#[wasm_bindgen]
+pub fn encode_set_keyboard_layout(klid: u32) -> Vec<u8> {
+    protocol::ClientMessage::SetKeyboardLayout { klid }.encode()
 }
 
 #[wasm_bindgen]

@@ -21,7 +21,8 @@ pub const MSG_KEY_EVENT: u8 = 0x13;
 pub const MSG_CLIENT_READY: u8 = 0x14;
 pub const MSG_SELECT_MONITOR: u8 = 0x15;
 pub const MSG_SELECT_AUDIO: u8 = 0x16;
-pub const MSG_KEY_UNICODE: u8 = 0x17;
+pub const MSG_KEY_SCANCODE: u8 = 0x17;
+pub const MSG_SET_KEYBOARD_LAYOUT: u8 = 0x18;
 
 // --- Monitor info ---
 
@@ -101,17 +102,23 @@ pub enum ClientMessage {
     MouseScroll { delta_x: i16, delta_y: i16 },
     /// `key_code` is a Windows Virtual-Key code (VK_*).
     KeyEvent { key_code: u16, pressed: bool },
-    /// Inject the given Unicode character on the remote, bypassing the
-    /// remote keyboard layout. `codepoint` is a Unicode scalar value;
-    /// values outside the BMP are split into a UTF-16 surrogate pair on
-    /// the receiver. Used for plain typing so the character the user
-    /// sees locally is the character that arrives on the remote machine.
-    KeyUnicode { codepoint: u32, pressed: bool },
+    /// Inject a hardware key event by **PS/2 Set 1 scancode** (the
+    /// "Parsec method"). The remote interprets the scancode through
+    /// its currently active keyboard layout, so the physical key the
+    /// user pressed produces the same character it would on a locally
+    /// attached keyboard with that layout. `extended` corresponds to
+    /// the `0xE0` prefix and is passed to `SendInput` as
+    /// `KEYEVENTF_EXTENDEDKEY`.
+    KeyScancode { scancode: u16, extended: bool, pressed: bool },
     ClientReady,
     /// Select a monitor by index.
     SelectMonitor { index: u8 },
     /// Select an audio capture device by index, or 0xFF to disable audio.
     SelectAudio { index: u8 },
+    /// Switch the keyboard layout used to interpret incoming scancodes
+    /// on the remote. `klid` is a Windows Keyboard-Layout-ID such as
+    /// `0x0000_0407` (de-DE) or `0x0000_0409` (en-US).
+    SetKeyboardLayout { klid: u32 },
 }
 
 // --- Encoding ---
@@ -214,10 +221,11 @@ impl ClientMessage {
                 buf.push(u8::from(*pressed));
                 buf
             }
-            ClientMessage::KeyUnicode { codepoint, pressed } => {
-                let mut buf = Vec::with_capacity(6);
-                buf.push(MSG_KEY_UNICODE);
-                buf.extend_from_slice(&codepoint.to_le_bytes());
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(MSG_KEY_SCANCODE);
+                buf.extend_from_slice(&scancode.to_le_bytes());
+                buf.push(u8::from(*extended));
                 buf.push(u8::from(*pressed));
                 buf
             }
@@ -229,6 +237,12 @@ impl ClientMessage {
             }
             ClientMessage::SelectAudio { index } => {
                 vec![MSG_SELECT_AUDIO, *index]
+            }
+            ClientMessage::SetKeyboardLayout { klid } => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(MSG_SET_KEYBOARD_LAYOUT);
+                buf.extend_from_slice(&klid.to_le_bytes());
+                buf
             }
         }
     }
@@ -341,10 +355,11 @@ impl ClientMessage {
                 let pressed = data[3] != 0;
                 Some(ClientMessage::KeyEvent { key_code, pressed })
             }
-            MSG_KEY_UNICODE if data.len() >= 6 => {
-                let codepoint = u32::from_le_bytes(data[1..5].try_into().ok()?);
-                let pressed = data[5] != 0;
-                Some(ClientMessage::KeyUnicode { codepoint, pressed })
+            MSG_KEY_SCANCODE if data.len() >= 5 => {
+                let scancode = u16::from_le_bytes(data[1..3].try_into().ok()?);
+                let extended = data[3] != 0;
+                let pressed = data[4] != 0;
+                Some(ClientMessage::KeyScancode { scancode, extended, pressed })
             }
             MSG_CLIENT_READY => Some(ClientMessage::ClientReady),
             MSG_SELECT_MONITOR if data.len() >= 2 => {
@@ -352,6 +367,10 @@ impl ClientMessage {
             }
             MSG_SELECT_AUDIO if data.len() >= 2 => {
                 Some(ClientMessage::SelectAudio { index: data[1] })
+            }
+            MSG_SET_KEYBOARD_LAYOUT if data.len() >= 5 => {
+                let klid = u32::from_le_bytes(data[1..5].try_into().ok()?);
+                Some(ClientMessage::SetKeyboardLayout { klid })
             }
             _ => None,
         }
@@ -425,27 +444,40 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_key_unicode() {
-        // BMP codepoint: 'ä' (U+00E4)
-        let msg = ClientMessage::KeyUnicode { codepoint: 0x00E4, pressed: true };
+    fn roundtrip_key_scancode() {
+        // Non-extended: physical 'Z' position on a US keyboard (PS/2 Set 1 = 0x2C)
+        let msg = ClientMessage::KeyScancode { scancode: 0x2C, extended: false, pressed: true };
         let encoded = msg.encode();
         let decoded = ClientMessage::decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::KeyUnicode { codepoint, pressed } => {
-                assert_eq!(codepoint, 0x00E4);
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                assert_eq!(scancode, 0x2C);
+                assert!(!extended);
                 assert!(pressed);
             }
             _ => panic!("wrong variant"),
         }
 
-        // Supplementary-plane codepoint: '😀' (U+1F600)
-        let msg = ClientMessage::KeyUnicode { codepoint: 0x1F600, pressed: false };
+        // Extended: ArrowUp (E0 48)
+        let msg = ClientMessage::KeyScancode { scancode: 0x48, extended: true, pressed: false };
         let encoded = msg.encode();
         match ClientMessage::decode(&encoded).unwrap() {
-            ClientMessage::KeyUnicode { codepoint, pressed } => {
-                assert_eq!(codepoint, 0x1F600);
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                assert_eq!(scancode, 0x48);
+                assert!(extended);
                 assert!(!pressed);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_set_keyboard_layout() {
+        // German (de-DE)
+        let msg = ClientMessage::SetKeyboardLayout { klid: 0x0000_0407 };
+        let encoded = msg.encode();
+        match ClientMessage::decode(&encoded).unwrap() {
+            ClientMessage::SetKeyboardLayout { klid } => assert_eq!(klid, 0x0000_0407),
             _ => panic!("wrong variant"),
         }
     }

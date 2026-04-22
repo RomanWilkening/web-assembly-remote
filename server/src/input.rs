@@ -48,12 +48,15 @@ impl InputSimulator {
             ClientMessage::KeyEvent { key_code, pressed } => {
                 Self::key_event(key_code, pressed);
             }
-            ClientMessage::KeyUnicode { codepoint, pressed } => {
-                Self::key_unicode(codepoint, pressed);
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                Self::key_scancode(scancode, extended, pressed);
             }
             ClientMessage::ClientReady => { /* nothing to do */ }
             ClientMessage::SelectMonitor { .. } => { /* handled by server */ }
             ClientMessage::SelectAudio { .. } => { /* handled by server */ }
+            ClientMessage::SetKeyboardLayout { klid } => {
+                Self::set_keyboard_layout(klid);
+            }
         }
     }
 
@@ -157,48 +160,75 @@ impl InputSimulator {
         }
     }
 
-    /// Inject a Unicode character via `SendInput` with `KEYEVENTF_UNICODE`.
-    /// Bypasses the keyboard layout entirely so the character that arrives
-    /// on the remote matches what the user typed locally.
+    /// Inject a hardware key event by PS/2 Set 1 scancode. The remote
+    /// translates the scancode through its currently active keyboard
+    /// layout, so the same physical key produces the same character it
+    /// would on a directly attached keyboard with that layout
+    /// ("Parsec method"). `extended` toggles `KEYEVENTF_EXTENDEDKEY`
+    /// (the 0xE0 prefix) which is required for cursor keys, the right
+    /// Ctrl/Alt/Win, the numpad-Enter and -Divide, Insert/Delete/Home/
+    /// End/PgUp/PgDn, and similar.
     #[cfg(windows)]
-    fn key_unicode(codepoint: u32, pressed: bool) {
+    fn key_scancode(scancode: u16, extended: bool, pressed: bool) {
         use winapi::um::winuser::{
-            SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+            SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+            KEYEVENTF_SCANCODE,
         };
 
-        // Convert the Unicode scalar value to one or two UTF-16 code units.
-        // Codepoints in the BMP (≤ 0xFFFF, excluding the surrogate range)
-        // are sent as a single event; supplementary-plane codepoints are
-        // sent as a UTF-16 surrogate pair (two SendInput events).
-        let mut units: [u16; 2] = [0; 2];
-        let unit_count: usize = if codepoint <= 0xFFFF {
-            // Reject lone surrogates – they are not valid scalar values.
-            if (0xD800..=0xDFFF).contains(&codepoint) {
+        let mut flags: u32 = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !pressed {
+            flags |= KEYEVENTF_KEYUP;
+        }
+
+        let mut input = INPUT::default();
+        input.type_ = INPUT_KEYBOARD;
+        unsafe {
+            let ki = input.u.ki_mut();
+            ki.wVk = 0;
+            ki.wScan = scancode;
+            ki.dwFlags = flags;
+            SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    /// Switch the keyboard layout used by the foreground window to the
+    /// requested KLID (e.g. `0x0000_0407` for de-DE). This is the
+    /// standard Win32 way of changing the input language used by the
+    /// language bar: load the layout, then ask the foreground window
+    /// to switch its input language to it.
+    #[cfg(windows)]
+    fn set_keyboard_layout(klid: u32) {
+        use std::iter::once;
+        use winapi::shared::minwindef::{LPARAM, WPARAM};
+        use winapi::um::winuser::{
+            GetForegroundWindow, LoadKeyboardLayoutW, PostMessageW, KLF_ACTIVATE,
+            WM_INPUTLANGCHANGEREQUEST,
+        };
+
+        // KLIDs are 8 hex digits, e.g. "00000407" for de-DE.
+        let klid_str: String = format!("{klid:08X}");
+        let wide: Vec<u16> = klid_str.encode_utf16().chain(once(0)).collect();
+
+        unsafe {
+            let hkl = LoadKeyboardLayoutW(wide.as_ptr(), KLF_ACTIVATE);
+            if hkl.is_null() {
+                log::warn!("LoadKeyboardLayoutW failed for KLID {klid_str}");
                 return;
             }
-            units[0] = codepoint as u16;
-            1
-        } else if codepoint <= 0x10_FFFF {
-            let v = codepoint - 0x1_0000;
-            units[0] = 0xD800 | ((v >> 10) as u16 & 0x3FF);
-            units[1] = 0xDC00 | (v as u16 & 0x3FF);
-            2
-        } else {
-            return;
-        };
-
-        let base_flags: u32 = KEYEVENTF_UNICODE | if pressed { 0 } else { KEYEVENTF_KEYUP };
-
-        for &unit in &units[..unit_count] {
-            let mut input = INPUT::default();
-            input.type_ = INPUT_KEYBOARD;
-            unsafe {
-                let ki = input.u.ki_mut();
-                ki.wVk = 0;
-                ki.wScan = unit;
-                ki.dwFlags = base_flags;
-                SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                log::warn!("No foreground window to send WM_INPUTLANGCHANGEREQUEST to");
+                return;
             }
+            // INPUTLANGCHANGE_SYSCHARSET is intentionally not set – we
+            // just want the foreground window to honour the new layout.
+            // HKL is a HANDLE (pointer); convert via usize for an
+            // explicit, lossless cast to LPARAM (which is isize).
+            PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 as WPARAM, hkl as usize as LPARAM);
+            log::info!("Requested keyboard layout switch to {klid_str}");
         }
     }
 
@@ -225,7 +255,12 @@ impl InputSimulator {
     }
 
     #[cfg(not(windows))]
-    fn key_unicode(_codepoint: u32, _pressed: bool) {
-        log::trace!("key_unicode stub");
+    fn key_scancode(_scancode: u16, _extended: bool, _pressed: bool) {
+        log::trace!("key_scancode stub");
+    }
+
+    #[cfg(not(windows))]
+    fn set_keyboard_layout(_klid: u32) {
+        log::trace!("set_keyboard_layout stub");
     }
 }

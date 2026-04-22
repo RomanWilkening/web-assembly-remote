@@ -103,6 +103,7 @@ async function main() {
   const btnStream       = document.getElementById('btn-stream');
   const toggleLatency   = document.getElementById('toggle-latency');
   const audioSelect     = document.getElementById('audio-select');
+  const layoutSelect    = document.getElementById('layout-select');
   const btnMute         = document.getElementById('btn-mute');
   const btnLogout       = document.getElementById('btn-logout');
   const remoteCursor    = document.getElementById('remote-cursor');
@@ -123,6 +124,25 @@ async function main() {
   let latencyVisible = false;
   /** Currently active monitor index (tracks what the server is capturing). */
   let currentMonitorIndex = 0;
+  /** Currently selected remote keyboard-layout KLID (default: de-DE). */
+  const LAYOUT_STORAGE_KEY = 'remote_keyboard_layout';
+  let currentLayoutKlid = 0x00000407;
+  try {
+    const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    if (stored) {
+      const v = parseInt(stored, 16);
+      if (!isNaN(v)) currentLayoutKlid = v >>> 0;
+    }
+  } catch (_) { /* localStorage may be unavailable */ }
+  // Reflect the selection in the dropdown.
+  const wantedLayoutValue = '0x' + currentLayoutKlid.toString(16).padStart(8, '0').toUpperCase();
+  const layoutOptions = [...layoutSelect.options];
+  const matchingLayoutOption = layoutOptions.find(
+    (o) => o.value.toUpperCase() === wantedLayoutValue,
+  );
+  if (matchingLayoutOption) {
+    layoutSelect.value = matchingLayoutOption.value;
+  }
   /** @type {WebSocket|null} */
   let ws = null;
 
@@ -415,6 +435,20 @@ async function main() {
     setTimeout(() => startStream(idx), 100);
   });
 
+  // ── 9b. Remote keyboard-layout selector ─────────────────────
+  layoutSelect.addEventListener('change', () => {
+    const v = parseInt(layoutSelect.value, 16);
+    if (isNaN(v)) return;
+    currentLayoutKlid = v >>> 0;
+    try {
+      localStorage.setItem(
+        LAYOUT_STORAGE_KEY,
+        '0x' + currentLayoutKlid.toString(16).padStart(8, '0').toUpperCase(),
+      );
+    } catch (_) { /* localStorage may be unavailable */ }
+    send(wasm.encode_set_keyboard_layout(currentLayoutKlid));
+  });
+
   // ── 10. Logout ───────────────────────────────────────────────
   btnLogout.addEventListener('click', () => {
     stopStream();
@@ -482,6 +516,9 @@ async function main() {
       statusEl.textContent = 'Connected – waiting for first frame…';
       // Always tell the server which monitor to capture.
       send(wasm.encode_select_monitor(currentMonitorIndex));
+      // Set the remote keyboard layout so scancode-forwarded keystrokes
+      // are interpreted correctly (default de-DE; user-selectable).
+      send(wasm.encode_set_keyboard_layout(currentLayoutKlid));
       // Start the stall detector – if no video frame arrives within the
       // timeout the connection will be recycled automatically.
       resetStallTimer();
