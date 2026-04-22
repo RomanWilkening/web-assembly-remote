@@ -4,6 +4,11 @@
  *
  * Uses an AudioWorklet with a ring buffer for smooth playback and
  * a GainNode to implement mute/unmute.  Starts muted by default.
+ *
+ * Memory: PCM payloads are copied into ArrayBuffers drawn from a small
+ * free-list pool that the worklet returns to us via `port.postMessage`.
+ * That keeps GC pressure flat (~50 chunks/s would otherwise allocate
+ * ~50 fresh ArrayBuffers/s).
  */
 
 export class AudioPlayer {
@@ -20,6 +25,9 @@ export class AudioPlayer {
     this._ready = false;
     /** @private @type {Promise<void>|null} */
     this._initPromise = null;
+    /** @private @type {ArrayBuffer[]} – free-list of recyclable transfer buffers */
+    this._bufferPool = [];
+    /** @private */ this._poolMax = 8;
   }
 
   /**
@@ -48,6 +56,13 @@ export class AudioPlayer {
       this._worklet = new AudioWorkletNode(this._ctx, 'pcm-player', {
         outputChannelCount: [2],
       });
+      // Worklet returns consumed buffers so we can recycle them.
+      this._worklet.port.onmessage = (ev) => {
+        if (ev.data instanceof ArrayBuffer
+            && this._bufferPool.length < this._poolMax) {
+          this._bufferPool.push(ev.data);
+        }
+      };
       this._worklet.connect(this._gain);
 
       this._ready = true;
@@ -70,12 +85,20 @@ export class AudioPlayer {
       this._ctx.resume().catch(() => {});
     }
 
-    // Copy the bytes into an ArrayBuffer and transfer to the worklet.
-    const copy = pcmBytes.buffer.slice(
-      pcmBytes.byteOffset,
-      pcmBytes.byteOffset + pcmBytes.byteLength,
-    );
-    this._worklet.port.postMessage(copy, [copy]);
+    const len = pcmBytes.byteLength;
+    // Reuse a pooled ArrayBuffer if we have one of the right size; the
+    // worklet returns each consumed buffer back to us via postMessage.
+    let buf = null;
+    while (this._bufferPool.length > 0) {
+      const candidate = this._bufferPool.pop();
+      if (candidate.byteLength === len) { buf = candidate; break; }
+      // Otherwise drop it on the floor — different chunk size, can't reuse.
+    }
+    if (!buf) buf = new ArrayBuffer(len);
+
+    new Uint8Array(buf).set(pcmBytes);
+    // Transfer ownership so no copy crosses the worklet boundary.
+    this._worklet.port.postMessage(buf, [buf]);
   }
 
   /**

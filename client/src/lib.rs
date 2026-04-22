@@ -3,8 +3,9 @@ use wasm_bindgen::prelude::*;
 // Re-export protocol constants so JS can reference them if needed.
 pub use protocol::{
     MSG_AUDIO_DATA, MSG_AUDIO_DEVICE_LIST, MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT,
-    MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL, MSG_SELECT_AUDIO,
-    MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
+    MSG_KEY_SCANCODE, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL,
+    MSG_PING, MSG_PONG, MSG_SELECT_AUDIO, MSG_SELECT_MONITOR, MSG_SERVER_INFO,
+    MSG_SET_KEYBOARD_LAYOUT, MSG_VIDEO_FRAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,23 @@ pub fn encode_key_event(key_code: u16, pressed: bool) -> Vec<u8> {
     protocol::ClientMessage::KeyEvent { key_code, pressed }.encode()
 }
 
+/// Encode a hardware-scancode key event (Parsec-style forwarding).
+/// `scancode` is a PS/2 Set 1 scancode; `extended` corresponds to the
+/// `0xE0` prefix (cursor keys, right-hand modifiers, numpad enter,
+/// etc.). The remote interprets the scancode through its currently
+/// active keyboard layout.
+#[wasm_bindgen]
+pub fn encode_key_scancode(scancode: u16, extended: bool, pressed: bool) -> Vec<u8> {
+    protocol::ClientMessage::KeyScancode { scancode, extended, pressed }.encode()
+}
+
+/// Switch the active keyboard layout on the remote. `klid` is a
+/// Windows Keyboard-Layout-ID, e.g. `0x0000_0407` for de-DE.
+#[wasm_bindgen]
+pub fn encode_set_keyboard_layout(klid: u32) -> Vec<u8> {
+    protocol::ClientMessage::SetKeyboardLayout { klid }.encode()
+}
+
 #[wasm_bindgen]
 pub fn encode_select_monitor(index: u8) -> Vec<u8> {
     protocol::ClientMessage::SelectMonitor { index }.encode()
@@ -46,100 +64,36 @@ pub fn encode_select_audio(index: u8) -> Vec<u8> {
     protocol::ClientMessage::SelectAudio { index }.encode()
 }
 
+/// Encode a `Ping` client message containing a client-supplied
+/// timestamp (microseconds, opaque to the server). The server echoes
+/// it back as `Pong`, allowing the client to compute round-trip time
+/// using only its own clock.
+///
+/// `client_ts_us` is `f64` because JavaScript numbers are doubles;
+/// any value in the realistic Unix-microsecond range fits losslessly
+/// in 53 bits of mantissa.
+#[wasm_bindgen]
+pub fn encode_ping(client_ts_us: f64) -> Vec<u8> {
+    let ts = if client_ts_us.is_finite() && client_ts_us >= 0.0 {
+        client_ts_us as u64
+    } else {
+        0
+    };
+    protocol::ClientMessage::Ping { client_ts_us: ts }.encode()
+}
+
 // ---------------------------------------------------------------------------
 // Decode helpers – called from JavaScript to parse incoming server messages.
+//
+// NOTE on the hot-path: small fixed-layout headers (VideoFrame, Pong,
+// CursorInfo, ServerInfo) are now parsed directly in JS via `DataView`
+// instead of routed through wasm-bindgen.  Each `&[u8]` parameter forces
+// wasm-bindgen to copy the *entire* `Uint8Array` into the WASM linear
+// memory — for a 4K key-frame that is hundreds of KB of needless memcpy
+// per frame.  The helpers below are kept only for messages that contain
+// variable-length nested data (monitor list, audio device list) where
+// implementing the parser in JS is more error-prone than worth.
 // ---------------------------------------------------------------------------
-
-/// Decode the first byte of a server message to determine its type.
-/// Returns the MSG_* constant, or 0 if invalid.
-#[wasm_bindgen]
-pub fn message_type(data: &[u8]) -> u8 {
-    data.first().copied().unwrap_or(0)
-}
-
-/// For a VideoFrame message, extract the 8-byte timestamp (microseconds).
-#[wasm_bindgen]
-pub fn video_frame_timestamp(data: &[u8]) -> f64 {
-    if data.len() < 10 || data[0] != MSG_VIDEO_FRAME {
-        return 0.0;
-    }
-    let ts = u64::from_le_bytes(data[1..9].try_into().unwrap_or_default());
-    ts as f64
-}
-
-/// For a VideoFrame message, return whether it is a key-frame.
-#[wasm_bindgen]
-pub fn video_frame_is_keyframe(data: &[u8]) -> bool {
-    if data.len() < 10 || data[0] != MSG_VIDEO_FRAME {
-        return false;
-    }
-    data[9] != 0
-}
-
-/// For a VideoFrame message, return the offset where H.264 data begins.
-/// The caller can use this to create a sub-view of the ArrayBuffer.
-#[wasm_bindgen]
-pub fn video_frame_data_offset() -> usize {
-    10
-}
-
-/// For a ServerInfo message, extract width.
-#[wasm_bindgen]
-pub fn server_info_width(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_SERVER_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[1..3].try_into().unwrap_or_default())
-}
-
-/// For a ServerInfo message, extract height.
-#[wasm_bindgen]
-pub fn server_info_height(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_SERVER_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[3..5].try_into().unwrap_or_default())
-}
-
-/// For a ServerInfo message, extract FPS.
-#[wasm_bindgen]
-pub fn server_info_fps(data: &[u8]) -> u8 {
-    if data.len() < 6 || data[0] != MSG_SERVER_INFO {
-        return 0;
-    }
-    data[5]
-}
-
-// ---------------------------------------------------------------------------
-// Cursor info decode helpers
-// ---------------------------------------------------------------------------
-
-/// For a CursorInfo message, extract X position.
-#[wasm_bindgen]
-pub fn cursor_info_x(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[1..3].try_into().unwrap_or_default())
-}
-
-/// For a CursorInfo message, extract Y position.
-#[wasm_bindgen]
-pub fn cursor_info_y(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[3..5].try_into().unwrap_or_default())
-}
-
-/// For a CursorInfo message, extract visibility.
-#[wasm_bindgen]
-pub fn cursor_info_visible(data: &[u8]) -> bool {
-    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
-        return false;
-    }
-    data[5] != 0
-}
 
 // ---------------------------------------------------------------------------
 // Monitor list decode helpers

@@ -12,6 +12,7 @@ pub const MSG_CURSOR_INFO: u8 = 0x03;
 pub const MSG_MONITOR_LIST: u8 = 0x04;
 pub const MSG_AUDIO_DATA: u8 = 0x05;
 pub const MSG_AUDIO_DEVICE_LIST: u8 = 0x06;
+pub const MSG_PONG: u8 = 0x07;
 
 // Client → Server
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -21,6 +22,9 @@ pub const MSG_KEY_EVENT: u8 = 0x13;
 pub const MSG_CLIENT_READY: u8 = 0x14;
 pub const MSG_SELECT_MONITOR: u8 = 0x15;
 pub const MSG_SELECT_AUDIO: u8 = 0x16;
+pub const MSG_KEY_SCANCODE: u8 = 0x17;
+pub const MSG_SET_KEYBOARD_LAYOUT: u8 = 0x18;
+pub const MSG_PING: u8 = 0x19;
 
 // --- Monitor info ---
 
@@ -89,6 +93,14 @@ pub enum ServerMessage {
     AudioDeviceList {
         devices: Vec<AudioDeviceInfo>,
     },
+    /// Reply to a client `Ping`. Echoes the client's timestamp verbatim
+    /// so the client can compute round-trip time using only its own
+    /// monotonic clock (no NTP / clock-sync between server and browser
+    /// required).
+    Pong {
+        /// The exact value the client sent in `ClientMessage::Ping`.
+        client_ts_us: u64,
+    },
 }
 
 // --- Client messages ---
@@ -100,11 +112,27 @@ pub enum ClientMessage {
     MouseScroll { delta_x: i16, delta_y: i16 },
     /// `key_code` is a Windows Virtual-Key code (VK_*).
     KeyEvent { key_code: u16, pressed: bool },
+    /// Inject a hardware key event by **PS/2 Set 1 scancode** (the
+    /// "Parsec method"). The remote interprets the scancode through
+    /// its currently active keyboard layout, so the physical key the
+    /// user pressed produces the same character it would on a locally
+    /// attached keyboard with that layout. `extended` corresponds to
+    /// the `0xE0` prefix and is passed to `SendInput` as
+    /// `KEYEVENTF_EXTENDEDKEY`.
+    KeyScancode { scancode: u16, extended: bool, pressed: bool },
     ClientReady,
     /// Select a monitor by index.
     SelectMonitor { index: u8 },
     /// Select an audio capture device by index, or 0xFF to disable audio.
     SelectAudio { index: u8 },
+    /// Switch the keyboard layout used to interpret incoming scancodes
+    /// on the remote. `klid` is a Windows Keyboard-Layout-ID such as
+    /// `0x0000_0407` (de-DE) or `0x0000_0409` (en-US).
+    SetKeyboardLayout { klid: u32 },
+    /// Round-trip-time measurement request. The server replies with
+    /// `ServerMessage::Pong` echoing `client_ts_us` verbatim so the
+    /// client can compute RTT against its own clock.
+    Ping { client_ts_us: u64 },
 }
 
 // --- Encoding ---
@@ -170,6 +198,12 @@ impl ServerMessage {
                 }
                 buf
             }
+            ServerMessage::Pong { client_ts_us } => {
+                let mut buf = Vec::with_capacity(1 + 8);
+                buf.push(MSG_PONG);
+                buf.extend_from_slice(&client_ts_us.to_le_bytes());
+                buf
+            }
         }
     }
 }
@@ -207,6 +241,14 @@ impl ClientMessage {
                 buf.push(u8::from(*pressed));
                 buf
             }
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(MSG_KEY_SCANCODE);
+                buf.extend_from_slice(&scancode.to_le_bytes());
+                buf.push(u8::from(*extended));
+                buf.push(u8::from(*pressed));
+                buf
+            }
             ClientMessage::ClientReady => {
                 vec![MSG_CLIENT_READY]
             }
@@ -215,6 +257,18 @@ impl ClientMessage {
             }
             ClientMessage::SelectAudio { index } => {
                 vec![MSG_SELECT_AUDIO, *index]
+            }
+            ClientMessage::SetKeyboardLayout { klid } => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(MSG_SET_KEYBOARD_LAYOUT);
+                buf.extend_from_slice(&klid.to_le_bytes());
+                buf
+            }
+            ClientMessage::Ping { client_ts_us } => {
+                let mut buf = Vec::with_capacity(1 + 8);
+                buf.push(MSG_PING);
+                buf.extend_from_slice(&client_ts_us.to_le_bytes());
+                buf
             }
         }
     }
@@ -294,6 +348,10 @@ impl ServerMessage {
                 }
                 Some(ServerMessage::AudioDeviceList { devices })
             }
+            MSG_PONG if data.len() >= 9 => {
+                let client_ts_us = u64::from_le_bytes(data[1..9].try_into().ok()?);
+                Some(ServerMessage::Pong { client_ts_us })
+            }
             _ => None,
         }
     }
@@ -327,12 +385,26 @@ impl ClientMessage {
                 let pressed = data[3] != 0;
                 Some(ClientMessage::KeyEvent { key_code, pressed })
             }
+            MSG_KEY_SCANCODE if data.len() >= 5 => {
+                let scancode = u16::from_le_bytes(data[1..3].try_into().ok()?);
+                let extended = data[3] != 0;
+                let pressed = data[4] != 0;
+                Some(ClientMessage::KeyScancode { scancode, extended, pressed })
+            }
             MSG_CLIENT_READY => Some(ClientMessage::ClientReady),
             MSG_SELECT_MONITOR if data.len() >= 2 => {
                 Some(ClientMessage::SelectMonitor { index: data[1] })
             }
             MSG_SELECT_AUDIO if data.len() >= 2 => {
                 Some(ClientMessage::SelectAudio { index: data[1] })
+            }
+            MSG_SET_KEYBOARD_LAYOUT if data.len() >= 5 => {
+                let klid = u32::from_le_bytes(data[1..5].try_into().ok()?);
+                Some(ClientMessage::SetKeyboardLayout { klid })
+            }
+            MSG_PING if data.len() >= 9 => {
+                let client_ts_us = u64::from_le_bytes(data[1..9].try_into().ok()?);
+                Some(ClientMessage::Ping { client_ts_us })
             }
             _ => None,
         }
@@ -401,6 +473,61 @@ mod tests {
                 assert_eq!(key_code, 0x41);
                 assert!(pressed);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_key_scancode() {
+        // Non-extended: physical 'Z' position on a US keyboard (PS/2 Set 1 = 0x2C)
+        let msg = ClientMessage::KeyScancode { scancode: 0x2C, extended: false, pressed: true };
+        let encoded = msg.encode();
+        let decoded = ClientMessage::decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                assert_eq!(scancode, 0x2C);
+                assert!(!extended);
+                assert!(pressed);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Extended: ArrowUp (E0 48)
+        let msg = ClientMessage::KeyScancode { scancode: 0x48, extended: true, pressed: false };
+        let encoded = msg.encode();
+        match ClientMessage::decode(&encoded).unwrap() {
+            ClientMessage::KeyScancode { scancode, extended, pressed } => {
+                assert_eq!(scancode, 0x48);
+                assert!(extended);
+                assert!(!pressed);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_set_keyboard_layout() {
+        // German (de-DE)
+        let msg = ClientMessage::SetKeyboardLayout { klid: 0x0000_0407 };
+        let encoded = msg.encode();
+        match ClientMessage::decode(&encoded).unwrap() {
+            ClientMessage::SetKeyboardLayout { klid } => assert_eq!(klid, 0x0000_0407),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_ping_pong() {
+        let ts = 1_700_000_000_000_000_u64;
+        let encoded = ClientMessage::Ping { client_ts_us: ts }.encode();
+        match ClientMessage::decode(&encoded).unwrap() {
+            ClientMessage::Ping { client_ts_us } => assert_eq!(client_ts_us, ts),
+            _ => panic!("wrong variant"),
+        }
+
+        let encoded = ServerMessage::Pong { client_ts_us: ts }.encode();
+        match ServerMessage::decode(&encoded).unwrap() {
+            ServerMessage::Pong { client_ts_us } => assert_eq!(client_ts_us, ts),
             _ => panic!("wrong variant"),
         }
     }

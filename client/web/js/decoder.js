@@ -27,6 +27,8 @@ export class H264Decoder {
     this._codedHeight = 0;
     /** @private */
     this._useSoftware = false;
+    /** @private @type {number|null} – most recent measured one-way latency (ms) */
+    this._latencyMs = null;
   }
 
   /**
@@ -136,9 +138,15 @@ export class H264Decoder {
 
     // When frames arrive in bursts (common with SSL-inspecting proxies
     // like Netskope that buffer data), the decoder queue can grow
-    // unbounded. Drop non-key delta frames to prevent overload;
-    // always accept key-frames so the decoder can resynchronise.
-    if (!isKeyFrame && this._decoder.decodeQueueSize > 3) {
+    // unbounded.  Drop non-key delta frames to prevent overload; always
+    // accept key-frames so the decoder can resynchronise.
+    //
+    // The threshold adapts to the current network RTT: a healthy 10 ms
+    // link can absorb a small queue without adding visible lag, whereas
+    // a 200 ms link should drop aggressively.  Caller updates RTT via
+    // `setRttMs()`; falls back to a conservative magic number of 3 if
+    // no RTT samples have been recorded yet.
+    if (!isKeyFrame && this._decoder.decodeQueueSize > this._dropThreshold()) {
       return;
     }
 
@@ -157,6 +165,41 @@ export class H264Decoder {
       console.error('decode() threw:', e);
       this._configured = false;
     }
+  }
+
+  /**
+   * Update the most recent measured one-way latency (ms).  Used to
+   * adapt the decoder-queue drop threshold so a fast link allows a
+   * slightly deeper queue (smoother) and a slow link drops earlier
+   * (lower latency).  Call from the Pong handler.
+   * @param {number} oneWayMs
+   */
+  setLatencyMs(oneWayMs) {
+    if (Number.isFinite(oneWayMs) && oneWayMs >= 0) {
+      this._latencyMs = oneWayMs;
+    }
+  }
+
+  /**
+   * Compute the adaptive drop threshold from the most recent latency
+   * sample.  Bands chosen empirically:
+   *   * `< 20 ms` (LAN): allow up to 5 queued frames so brief jitter
+   *     never causes a drop — at this latency 5 frames ≈ 80 ms of
+   *     buffer which is invisible to the user.
+   *   * `20–60 ms` (typical WAN): 3 frames ≈ one half-second of buffer
+   *     at 60 fps; balances smoothness against motion-to-photon lag.
+   *   * `≥ 60 ms` (slow / congested): drop earlier (2 frames) because
+   *     each queued frame becomes a *visible* lag spike.
+   * The numbers are heuristics — tweak if profiling on a specific
+   * link suggests otherwise.
+   * @private
+   */
+  _dropThreshold() {
+    const ms = this._latencyMs;
+    if (ms == null) return 3;        // no measurement yet
+    if (ms < 20)  return 5;          // LAN
+    if (ms < 60)  return 3;          // typical WAN
+    return 2;                         // slow / congested
   }
 
   close() {

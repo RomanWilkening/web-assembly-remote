@@ -15,6 +15,12 @@ html, body {
   font-family: system-ui, -apple-system, sans-serif;
 }
 
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 #screen {
   display: block;
   width: 100vw;
@@ -45,6 +51,10 @@ html, body {
 #latency {
   font-variant-numeric: tabular-nums;
   color: #6f6;
+}
+
+#latency.hidden {
+  display: none;
 }
 
 /* Control toolbar (top-right) */

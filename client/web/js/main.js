@@ -19,6 +19,7 @@ const MSG_CURSOR_INFO        = 0x03;
 const MSG_MONITOR_LIST       = 0x04;
 const MSG_AUDIO_DATA         = 0x05;
 const MSG_AUDIO_DEVICE_LIST  = 0x06;
+const MSG_PONG               = 0x07;
 
 // ---------------------------------------------------------------------------
 // WASM loading with explicit fetch, timeout, and retry.
@@ -54,8 +55,10 @@ async function loadWasm(timeoutMs = 15000) {
     });
     clearTimeout(timer);
     // Pass the Response directly to wasm-bindgen init() so it does not
-    // issue its own (potentially cacheable) fetch.
-    await wasmModule.default(response);
+    // issue its own (potentially cacheable) fetch.  Newer wasm-bindgen
+    // versions require an options object instead of a positional arg
+    // (positional usage logs a deprecation warning and may be removed).
+    await wasmModule.default({ module_or_path: response });
   } catch (e) {
     clearTimeout(timer);
     throw e;
@@ -101,7 +104,9 @@ async function main() {
   const btnFullscreen   = document.getElementById('btn-fullscreen');
   const btnPointerLock  = document.getElementById('btn-pointerlock');
   const btnStream       = document.getElementById('btn-stream');
+  const toggleLatency   = document.getElementById('toggle-latency');
   const audioSelect     = document.getElementById('audio-select');
+  const layoutSelect    = document.getElementById('layout-select');
   const btnMute         = document.getElementById('btn-mute');
   const btnLogout       = document.getElementById('btn-logout');
   const remoteCursor    = document.getElementById('remote-cursor');
@@ -112,8 +117,35 @@ async function main() {
   let pointerLocked = false;
   let remoteW = 0;
   let remoteH = 0;
+  /** Last known remote cursor position (cached so we can re-show it after
+   *  the browser tab regains visibility, when no new MSG_CURSOR_INFO arrives
+   *  until the cursor moves on the remote machine). */
+  let lastCursorX = 0;
+  let lastCursorY = 0;
+  let lastCursorVisible = false;
+  /** Latency display visibility – off by default. */
+  let latencyVisible = false;
   /** Currently active monitor index (tracks what the server is capturing). */
   let currentMonitorIndex = 0;
+  /** Currently selected remote keyboard-layout KLID (default: de-DE). */
+  const LAYOUT_STORAGE_KEY = 'remote_keyboard_layout';
+  let currentLayoutKlid = 0x00000407;
+  try {
+    const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    if (stored) {
+      const v = parseInt(stored, 16);
+      if (!isNaN(v)) currentLayoutKlid = v >>> 0;
+    }
+  } catch (_) { /* localStorage may be unavailable */ }
+  // Reflect the selection in the dropdown.
+  const wantedLayoutValue = '0x' + currentLayoutKlid.toString(16).padStart(8, '0').toUpperCase();
+  const layoutOptions = [...layoutSelect.options];
+  const matchingLayoutOption = layoutOptions.find(
+    (o) => o.value.toUpperCase() === wantedLayoutValue,
+  );
+  if (matchingLayoutOption) {
+    layoutSelect.value = matchingLayoutOption.value;
+  }
   /** @type {WebSocket|null} */
   let ws = null;
 
@@ -213,8 +245,9 @@ async function main() {
   /** @type {InputHandler|null} */
   let inputHandler = null;
 
-  // Periodic latency display update.
+  // Periodic latency display update (only when the user has enabled it).
   setInterval(() => {
+    if (!latencyVisible) return;
     if (latencyTracker.count() > 0) {
       const avg = latencyTracker.average_ms().toFixed(1);
       const min = latencyTracker.min_ms().toFixed(1);
@@ -222,6 +255,35 @@ async function main() {
       latencyEl.textContent = `Latency: ${avg} ms  (min ${min} / max ${max})`;
     }
   }, 500);
+
+  // Periodic Ping → Pong RTT measurement.  Computing RTT entirely on
+  // the client clock avoids any dependency on the server and browser
+  // system clocks being NTP-synchronised; the previously used
+  // (now - server_ts) calculation reported the clock skew between the
+  // two machines (often hundreds of milliseconds) on top of the real
+  // latency.  We send a ping every second and report RTT/2 as the
+  /** Wall-clock microseconds, monotonic enough for RTT measurement. */
+  const nowMicros = () => (performance.timeOrigin + performance.now()) * 1000;
+  // approximate one-way latency.
+  setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const nowUs = nowMicros();
+    try {
+      send(wasm.encode_ping(nowUs));
+    } catch (e) {
+      // wasm not loaded yet or send failed – ignore.
+    }
+  }, 1000);
+
+  // Latency display toggle (off by default).
+  toggleLatency.checked = latencyVisible;
+  toggleLatency.addEventListener('change', () => {
+    latencyVisible = toggleLatency.checked;
+    latencyEl.classList.toggle('hidden', !latencyVisible);
+    if (!latencyVisible) {
+      latencyEl.textContent = '';
+    }
+  });
 
   // ── 4. Toolbar toggle with Escape ────────────────────────────
   document.addEventListener('keydown', (e) => {
@@ -290,18 +352,41 @@ async function main() {
   // ── 7. Scale selector ────────────────────────────────────────
   scaleSelect.addEventListener('change', () => {
     applyScale(scaleSelect.value);
+    // Reposition the remote cursor for the new layout.
+    updateRemoteCursor(lastCursorX, lastCursorY, lastCursorVisible);
   });
 
   function applyScale(mode) {
     if (mode === 'fit') {
+      // Stretch to fill the viewport (may distort aspect ratio).
       canvas.style.width = '100vw';
       canvas.style.height = '100vh';
+    } else if (mode === 'fit-aspect') {
+      // Fit inside the viewport while preserving the original aspect ratio.
+      if (remoteW > 0 && remoteH > 0) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const scale = Math.min(vw / remoteW, vh / remoteH);
+        canvas.style.width  = `${Math.floor(remoteW * scale)}px`;
+        canvas.style.height = `${Math.floor(remoteH * scale)}px`;
+      } else {
+        canvas.style.width = '100vw';
+        canvas.style.height = '100vh';
+      }
     } else {
       const pct = parseInt(mode) / 100;
       canvas.style.width  = `${remoteW * pct}px`;
       canvas.style.height = `${remoteH * pct}px`;
     }
   }
+
+  // Re-apply the current scale when the viewport size changes so that
+  // the "Fit (keep aspect)" mode adapts to the new window dimensions
+  // and the cursor overlay stays aligned with the canvas.
+  window.addEventListener('resize', () => {
+    applyScale(scaleSelect.value);
+    updateRemoteCursor(lastCursorX, lastCursorY, lastCursorVisible);
+  });
 
   // ── 8. Stream start/stop ─────────────────────────────────────
   btnStream.addEventListener('click', () => {
@@ -372,6 +457,20 @@ async function main() {
     setTimeout(() => startStream(idx), 100);
   });
 
+  // ── 9b. Remote keyboard-layout selector ─────────────────────
+  layoutSelect.addEventListener('change', () => {
+    const v = parseInt(layoutSelect.value, 16);
+    if (isNaN(v)) return;
+    currentLayoutKlid = v >>> 0;
+    try {
+      localStorage.setItem(
+        LAYOUT_STORAGE_KEY,
+        '0x' + currentLayoutKlid.toString(16).padStart(8, '0').toUpperCase(),
+      );
+    } catch (_) { /* localStorage may be unavailable */ }
+    send(wasm.encode_set_keyboard_layout(currentLayoutKlid));
+  });
+
   // ── 10. Logout ───────────────────────────────────────────────
   btnLogout.addEventListener('click', () => {
     stopStream();
@@ -387,6 +486,13 @@ async function main() {
 
   // ── 11. Remote cursor rendering ──────────────────────────────
   function updateRemoteCursor(cx, cy, visible) {
+    // Cache the latest known position so we can re-display the cursor
+    // after the tab regains focus, even if the remote machine has not
+    // sent another MSG_CURSOR_INFO update yet.
+    lastCursorX = cx;
+    lastCursorY = cy;
+    lastCursorVisible = visible;
+
     if (!visible || remoteW === 0 || remoteH === 0) {
       remoteCursor.classList.add('hidden');
       return;
@@ -402,6 +508,17 @@ async function main() {
 
     remoteCursor.style.transform = `translate(${px}px, ${py}px)`;
   }
+
+  // When the user switches back to this tab, the remote may not send a
+  // fresh CursorInfo until the cursor next moves – which leaves the
+  // overlay hidden while the local cursor is also hidden over the canvas.
+  // Re-apply the last known cursor position so the pointer reappears
+  // immediately on tab focus.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      updateRemoteCursor(lastCursorX, lastCursorY, lastCursorVisible);
+    }
+  });
 
   // ── 12. WebSocket connect ────────────────────────────────────
   function connect() {
@@ -421,6 +538,9 @@ async function main() {
       statusEl.textContent = 'Connected – waiting for first frame…';
       // Always tell the server which monitor to capture.
       send(wasm.encode_select_monitor(currentMonitorIndex));
+      // Set the remote keyboard layout so scancode-forwarded keystrokes
+      // are interpreted correctly (default de-DE; user-selectable).
+      send(wasm.encode_set_keyboard_layout(currentLayoutKlid));
       // Start the stall detector – if no video frame arrives within the
       // timeout the connection will be recycled automatically.
       resetStallTimer();
@@ -440,11 +560,19 @@ async function main() {
       console.error('WebSocket error:', e);
     });
 
+    // Reusable DataView over the current message – avoids constructing a
+    // new view per packet just to read the small header fields.
+    let dv = null;
+    let dvBuffer = null;
+
     ws.addEventListener('message', (event) => {
       const data = new Uint8Array(event.data);
       if (data.length === 0) return;
 
-      const type_ = wasm.message_type(data);
+      // Read the message-type byte directly in JS to avoid the
+      // wasm-bindgen `&[u8]` copy of the entire payload (which for a
+      // 4K key-frame can be hundreds of KB).
+      const type_ = data[0];
 
       switch (type_) {
         case MSG_MONITOR_LIST: {
@@ -502,9 +630,15 @@ async function main() {
         }
 
         case MSG_SERVER_INFO: {
-          const w   = wasm.server_info_width(data);
-          const h   = wasm.server_info_height(data);
-          const fps = wasm.server_info_fps(data);
+          // ServerInfo layout: [type u8][width u16 LE][height u16 LE][fps u8]
+          if (data.length < 6) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          const w   = dv.getUint16(data.byteOffset + 1, true);
+          const h   = dv.getUint16(data.byteOffset + 3, true);
+          const fps = data[5];
           console.log(`ServerInfo: ${w}×${h} @ ${fps} fps`);
           remoteW = w;
           remoteH = h;
@@ -525,29 +659,69 @@ async function main() {
         }
 
         case MSG_VIDEO_FRAME: {
-          const tsUs      = wasm.video_frame_timestamp(data);
-          const isKey     = wasm.video_frame_is_keyframe(data);
-          const offset    = wasm.video_frame_data_offset();
-          const h264Data  = data.subarray(offset);
+          // Hot-path: parse the 10-byte header directly in JS so the
+          // multi-MB H.264 payload is never copied into wasm linear
+          // memory just to read a timestamp + 1-byte flag.
+          // Layout: [type u8][timestamp_us u64 LE][is_keyframe u8][h264 …]
+          if (data.length < 10) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          // u64 little-endian → number (microseconds fit in 53 bits for
+          // any realistic Unix-time value, so the f64 conversion is
+          // lossless in practice).
+          const tsUs   = Number(dv.getBigUint64(data.byteOffset + 1, true));
+          const isKey  = data[9] !== 0;
+          const h264Data = data.subarray(10);
 
           // Reset the stall-detection timer on every received frame.
           resetStallTimer();
 
-          // Measure one-way latency (approximate, requires synchronised clocks).
-          const nowUs = performance.now() * 1000 + performance.timeOrigin * 1000;
-          const latencyMs = (nowUs - tsUs) / 1000;
-          if (latencyMs > 0 && latencyMs < 60000) {
-            latencyTracker.record(latencyMs);
-          }
+          // NOTE: Latency is measured separately via Ping/Pong (see the
+          // periodic pinger above and the MSG_PONG handler below) so it
+          // doesn't depend on server/client wall-clock synchronisation.
 
           decoder.decode(h264Data, isKey, tsUs);
           break;
         }
 
+        case MSG_PONG: {
+          // RTT measurement: the server echoes back the timestamp we
+          // sent in the matching Ping.  Compute the round-trip on the
+          // client clock alone and report half of it as the one-way
+          // latency estimate.
+          // Pong layout: [type u8][client_ts_us u64 LE]; parse in JS to
+          // skip the wasm-bindgen copy for this small but frequent msg.
+          if (data.length < 9) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          const sentUs = Number(dv.getBigUint64(data.byteOffset + 1, true));
+          const nowUs  = nowMicros();
+          const rttMs  = (nowUs - sentUs) / 1000;
+          if (rttMs >= 0 && rttMs < 60000) {
+            const oneWayMs = rttMs / 2;
+            latencyTracker.record(oneWayMs);
+            // Feed the latency back to the decoder so it can adapt its
+            // queue-drop threshold (deeper queue on LAN, shallower on
+            // slow links).  See `H264Decoder._dropThreshold`.
+            decoder.setLatencyMs(oneWayMs);
+          }
+          break;
+        }
+
         case MSG_CURSOR_INFO: {
-          const cx = wasm.cursor_info_x(data);
-          const cy = wasm.cursor_info_y(data);
-          const cv = wasm.cursor_info_visible(data);
+          // CursorInfo layout: [type u8][x u16 LE][y u16 LE][visible u8]
+          if (data.length < 6) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          const cx = dv.getUint16(data.byteOffset + 1, true);
+          const cy = dv.getUint16(data.byteOffset + 3, true);
+          const cv = data[5] !== 0;
           updateRemoteCursor(cx, cy, cv);
           break;
         }
