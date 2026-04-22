@@ -3,8 +3,8 @@ use wasm_bindgen::prelude::*;
 // Re-export protocol constants so JS can reference them if needed.
 pub use protocol::{
     MSG_AUDIO_DATA, MSG_AUDIO_DEVICE_LIST, MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT,
-    MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL, MSG_SELECT_AUDIO,
-    MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
+    MSG_KEY_UNICODE, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL,
+    MSG_SELECT_AUDIO, MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_VIDEO_FRAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,15 @@ pub fn encode_mouse_scroll(delta_x: i16, delta_y: i16) -> Vec<u8> {
 #[wasm_bindgen]
 pub fn encode_key_event(key_code: u16, pressed: bool) -> Vec<u8> {
     protocol::ClientMessage::KeyEvent { key_code, pressed }.encode()
+}
+
+/// Encode a Unicode character injection event.
+/// `codepoint` is a Unicode scalar value (0..=0x10FFFF). Used for plain
+/// typing so the remote receives exactly the character the user typed
+/// regardless of the keyboard layout active on the remote machine.
+#[wasm_bindgen]
+pub fn encode_key_unicode(codepoint: u32, pressed: bool) -> Vec<u8> {
+    protocol::ClientMessage::KeyUnicode { codepoint, pressed }.encode()
 }
 
 #[wasm_bindgen]

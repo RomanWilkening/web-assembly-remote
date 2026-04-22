@@ -21,6 +21,7 @@ pub const MSG_KEY_EVENT: u8 = 0x13;
 pub const MSG_CLIENT_READY: u8 = 0x14;
 pub const MSG_SELECT_MONITOR: u8 = 0x15;
 pub const MSG_SELECT_AUDIO: u8 = 0x16;
+pub const MSG_KEY_UNICODE: u8 = 0x17;
 
 // --- Monitor info ---
 
@@ -100,6 +101,12 @@ pub enum ClientMessage {
     MouseScroll { delta_x: i16, delta_y: i16 },
     /// `key_code` is a Windows Virtual-Key code (VK_*).
     KeyEvent { key_code: u16, pressed: bool },
+    /// Inject the given Unicode character on the remote, bypassing the
+    /// remote keyboard layout. `codepoint` is a Unicode scalar value;
+    /// values outside the BMP are split into a UTF-16 surrogate pair on
+    /// the receiver. Used for plain typing so the character the user
+    /// sees locally is the character that arrives on the remote machine.
+    KeyUnicode { codepoint: u32, pressed: bool },
     ClientReady,
     /// Select a monitor by index.
     SelectMonitor { index: u8 },
@@ -204,6 +211,13 @@ impl ClientMessage {
                 let mut buf = Vec::with_capacity(4);
                 buf.push(MSG_KEY_EVENT);
                 buf.extend_from_slice(&key_code.to_le_bytes());
+                buf.push(u8::from(*pressed));
+                buf
+            }
+            ClientMessage::KeyUnicode { codepoint, pressed } => {
+                let mut buf = Vec::with_capacity(6);
+                buf.push(MSG_KEY_UNICODE);
+                buf.extend_from_slice(&codepoint.to_le_bytes());
                 buf.push(u8::from(*pressed));
                 buf
             }
@@ -327,6 +341,11 @@ impl ClientMessage {
                 let pressed = data[3] != 0;
                 Some(ClientMessage::KeyEvent { key_code, pressed })
             }
+            MSG_KEY_UNICODE if data.len() >= 6 => {
+                let codepoint = u32::from_le_bytes(data[1..5].try_into().ok()?);
+                let pressed = data[5] != 0;
+                Some(ClientMessage::KeyUnicode { codepoint, pressed })
+            }
             MSG_CLIENT_READY => Some(ClientMessage::ClientReady),
             MSG_SELECT_MONITOR if data.len() >= 2 => {
                 Some(ClientMessage::SelectMonitor { index: data[1] })
@@ -400,6 +419,32 @@ mod tests {
             ClientMessage::KeyEvent { key_code, pressed } => {
                 assert_eq!(key_code, 0x41);
                 assert!(pressed);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_key_unicode() {
+        // BMP codepoint: 'ä' (U+00E4)
+        let msg = ClientMessage::KeyUnicode { codepoint: 0x00E4, pressed: true };
+        let encoded = msg.encode();
+        let decoded = ClientMessage::decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::KeyUnicode { codepoint, pressed } => {
+                assert_eq!(codepoint, 0x00E4);
+                assert!(pressed);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Supplementary-plane codepoint: '😀' (U+1F600)
+        let msg = ClientMessage::KeyUnicode { codepoint: 0x1F600, pressed: false };
+        let encoded = msg.encode();
+        match ClientMessage::decode(&encoded).unwrap() {
+            ClientMessage::KeyUnicode { codepoint, pressed } => {
+                assert_eq!(codepoint, 0x1F600);
+                assert!(!pressed);
             }
             _ => panic!("wrong variant"),
         }

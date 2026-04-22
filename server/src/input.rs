@@ -48,6 +48,9 @@ impl InputSimulator {
             ClientMessage::KeyEvent { key_code, pressed } => {
                 Self::key_event(key_code, pressed);
             }
+            ClientMessage::KeyUnicode { codepoint, pressed } => {
+                Self::key_unicode(codepoint, pressed);
+            }
             ClientMessage::ClientReady => { /* nothing to do */ }
             ClientMessage::SelectMonitor { .. } => { /* handled by server */ }
             ClientMessage::SelectAudio { .. } => { /* handled by server */ }
@@ -154,6 +157,51 @@ impl InputSimulator {
         }
     }
 
+    /// Inject a Unicode character via `SendInput` with `KEYEVENTF_UNICODE`.
+    /// Bypasses the keyboard layout entirely so the character that arrives
+    /// on the remote matches what the user typed locally.
+    #[cfg(windows)]
+    fn key_unicode(codepoint: u32, pressed: bool) {
+        use winapi::um::winuser::{
+            SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        };
+
+        // Convert the Unicode scalar value to one or two UTF-16 code units.
+        // Codepoints in the BMP (≤ 0xFFFF, excluding the surrogate range)
+        // are sent as a single event; supplementary-plane codepoints are
+        // sent as a UTF-16 surrogate pair (two SendInput events).
+        let mut units: [u16; 2] = [0; 2];
+        let unit_count: usize = if codepoint <= 0xFFFF {
+            // Reject lone surrogates – they are not valid scalar values.
+            if (0xD800..=0xDFFF).contains(&codepoint) {
+                return;
+            }
+            units[0] = codepoint as u16;
+            1
+        } else if codepoint <= 0x10_FFFF {
+            let v = codepoint - 0x1_0000;
+            units[0] = 0xD800 | ((v >> 10) as u16 & 0x3FF);
+            units[1] = 0xDC00 | (v as u16 & 0x3FF);
+            2
+        } else {
+            return;
+        };
+
+        let base_flags: u32 = KEYEVENTF_UNICODE | if pressed { 0 } else { KEYEVENTF_KEYUP };
+
+        for &unit in &units[..unit_count] {
+            let mut input = INPUT::default();
+            input.type_ = INPUT_KEYBOARD;
+            unsafe {
+                let ki = input.u.ki_mut();
+                ki.wVk = 0;
+                ki.wScan = unit;
+                ki.dwFlags = base_flags;
+                SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+    }
+
     // ── Non-Windows stubs (allow compilation on Linux CI) ──────
 
     #[cfg(not(windows))]
@@ -174,5 +222,10 @@ impl InputSimulator {
     #[cfg(not(windows))]
     fn key_event(_vk: u16, _pressed: bool) {
         log::trace!("key_event stub");
+    }
+
+    #[cfg(not(windows))]
+    fn key_unicode(_codepoint: u32, _pressed: bool) {
+        log::trace!("key_unicode stub");
     }
 }

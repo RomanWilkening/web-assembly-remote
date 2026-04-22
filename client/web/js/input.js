@@ -184,27 +184,164 @@ export class InputHandler {
     c.addEventListener('contextmenu', (e) => e.preventDefault());
 
     // ── Keyboard ──
+    //
+    // We deliver keystrokes to the remote in two different ways depending
+    // on what the user pressed:
+    //
+    //   • For plain typing (printable characters with no Ctrl/Meta/plain-Alt
+    //     modifier, including AltGr-produced characters like '@' on a
+    //     German layout), we send the actual Unicode character via
+    //     `encode_key_unicode`.  The server injects it with
+    //     SendInput+KEYEVENTF_UNICODE, which bypasses the keyboard layout
+    //     active on the remote.  This guarantees that what the user typed
+    //     locally is what arrives on the remote, regardless of the layout
+    //     mismatch between client (e.g. de-DE QWERTZ) and remote (e.g.
+    //     en-US QWERTY).
+    //
+    //   • For everything else – modifier keys, shortcuts (Ctrl+C, Alt+F4,
+    //     Win+L, …), navigation (arrows, Home/End/PgUp/PgDn), F-keys,
+    //     Enter/Tab/Backspace/Esc/Delete – we send the Windows Virtual-Key
+    //     code derived from `e.code` so that shortcuts behave consistently.
+    //
+    // We remember per-physical-key (`e.code`) which path was used on
+    // keydown so the matching keyup releases the same way.
+    /** @private @type {Map<string, {kind: 'unicode', codepoint: number} | {kind: 'vk', vk: number}>} */
+    this._pressedKeys = new Map();
+
     c.addEventListener('keydown', (e) => {
       // Don't intercept Ctrl+Alt+M (pointer lock toggle) or Escape (toolbar)
       if ((e.ctrlKey && e.altKey && e.code === 'KeyM') || e.key === 'Escape') {
         return;
       }
-      e.preventDefault();
-      const vk = VK_MAP[e.code];
-      if (vk !== undefined) {
-        this._send(this._wasm.encode_key_event(vk, true));
+      // Ignore dead keys – the browser will fire a follow-up event with
+      // the composed character (e.g. '´' + 'a' → 'á') which we forward
+      // as a Unicode injection.
+      if (e.key === 'Dead') {
+        e.preventDefault();
+        return;
       }
+      e.preventDefault();
+      // If this physical key is already marked as pressed (auto-repeat),
+      // re-send using the previously chosen path so it stays consistent.
+      const existing = this._pressedKeys.get(e.code);
+      if (existing) {
+        this._sendKeyDown(existing);
+        return;
+      }
+      const entry = this._chooseKeyEncoding(e);
+      if (!entry) return;
+      this._pressedKeys.set(e.code, entry);
+      this._sendKeyDown(entry);
     });
 
     c.addEventListener('keyup', (e) => {
       if ((e.ctrlKey && e.altKey && e.code === 'KeyM') || e.key === 'Escape') {
         return;
       }
-      e.preventDefault();
-      const vk = VK_MAP[e.code];
-      if (vk !== undefined) {
-        this._send(this._wasm.encode_key_event(vk, false));
+      if (e.key === 'Dead') {
+        e.preventDefault();
+        return;
       }
+      e.preventDefault();
+      const entry = this._pressedKeys.get(e.code);
+      this._pressedKeys.delete(e.code);
+      if (entry) {
+        this._sendKeyUp(entry);
+        return;
+      }
+      // Fallback: no record (e.g. keyup arrived without a matching
+      // keydown because the page just gained focus).  Use the same
+      // selection logic as keydown so we still release the right key.
+      const fallback = this._chooseKeyEncoding(e);
+      if (fallback) this._sendKeyUp(fallback);
     });
+
+    // If the page loses focus or the canvas loses keyboard focus, release
+    // every key we believe is still held.  Otherwise the remote can be
+    // left with "stuck" modifiers / characters.
+    const releaseAll = () => {
+      for (const entry of this._pressedKeys.values()) {
+        this._sendKeyUp(entry);
+      }
+      this._pressedKeys.clear();
+    };
+    window.addEventListener('blur', releaseAll);
+    c.addEventListener('blur', releaseAll);
+  }
+
+  /**
+   * Decide whether a key event should be sent as a Unicode character
+   * (so the remote sees the exact character regardless of its layout)
+   * or as a Windows Virtual-Key code (so shortcuts and special keys
+   * keep working).
+   * @private
+   * @param {KeyboardEvent} e
+   * @returns {{kind: 'unicode', codepoint: number} | {kind: 'vk', vk: number} | null}
+   */
+  _chooseKeyEncoding(e) {
+    // Pure modifier keys: always send as VK so the remote knows they
+    // are held while subsequent keys are pressed.
+    const isModifier =
+      e.code === 'ShiftLeft' || e.code === 'ShiftRight' ||
+      e.code === 'ControlLeft' || e.code === 'ControlRight' ||
+      e.code === 'AltLeft' || e.code === 'AltRight' ||
+      e.code === 'MetaLeft' || e.code === 'MetaRight';
+
+    // Determine whether this is a plain printable character that should
+    // be Unicode-injected.  `e.key` is a single Unicode character for
+    // printable keys, and a longer name (e.g. 'Enter', 'ArrowLeft') for
+    // non-printable keys.
+    //
+    // We also need to handle AltGr (which on Windows is reported as
+    // Ctrl+Alt) – AltGr-produced characters like '@' on a German
+    // keyboard should be sent as Unicode, not interpreted as Ctrl+Alt+Q.
+    const isAltGr = e.ctrlKey && e.altKey;
+    const ctrlOrMetaShortcut = (e.ctrlKey && !isAltGr) || e.metaKey;
+    const altShortcut = e.altKey && !isAltGr; // e.g. Alt+F4
+
+    // Use a Unicode codepoint when:
+    //   • the key produced exactly one Unicode scalar value, AND
+    //   • it is not a modifier key on its own, AND
+    //   • there is no Ctrl/Meta/plain-Alt shortcut active (AltGr is OK).
+    if (
+      !isModifier &&
+      !ctrlOrMetaShortcut &&
+      !altShortcut &&
+      typeof e.key === 'string' &&
+      e.key.length > 0
+    ) {
+      // `e.key` may be a single BMP character (length 1) or a
+      // surrogate pair representing a supplementary-plane codepoint
+      // (length 2).  `String.codePointAt(0)` handles both correctly.
+      const cp = e.key.codePointAt(0);
+      const charLen = cp > 0xFFFF ? 2 : 1;
+      if (e.key.length === charLen) {
+        return { kind: 'unicode', codepoint: cp };
+      }
+      // Multi-character names like 'Enter', 'Tab', 'ArrowUp' fall
+      // through to the VK path below.
+    }
+
+    const vk = VK_MAP[e.code];
+    if (vk === undefined) return null;
+    return { kind: 'vk', vk };
+  }
+
+  /** @private */
+  _sendKeyDown(entry) {
+    if (entry.kind === 'unicode') {
+      this._send(this._wasm.encode_key_unicode(entry.codepoint, true));
+    } else {
+      this._send(this._wasm.encode_key_event(entry.vk, true));
+    }
+  }
+
+  /** @private */
+  _sendKeyUp(entry) {
+    if (entry.kind === 'unicode') {
+      this._send(this._wasm.encode_key_unicode(entry.codepoint, false));
+    } else {
+      this._send(this._wasm.encode_key_event(entry.vk, false));
+    }
   }
 }
