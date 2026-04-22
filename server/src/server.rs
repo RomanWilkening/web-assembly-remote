@@ -18,7 +18,7 @@ use crate::auth::{self, AuthState};
 use crate::capture::{self, ScreenCapture};
 use crate::config::AuthConfig;
 use crate::cursor;
-use crate::encoder::{EncodedFrame, FfmpegEncoder};
+use crate::encoder::{Chroma, CodecKind, EncodedFrame, EncoderConfig, FfmpegEncoder};
 use crate::input::InputSimulator;
 use crate::audio;
 
@@ -27,6 +27,10 @@ pub struct ServerConfig {
     pub fps: u32,
     pub quality: u8,
     pub encoder: String,
+    pub codec: CodecKind,
+    pub chroma: Chroma,
+    pub slices: u32,
+    pub bitrate_kbps: Option<u32>,
     pub static_dir: String,
     pub auth: AuthConfig,
     pub audio_device: Option<String>,
@@ -37,6 +41,10 @@ struct AppState {
     fps: u32,
     quality: u8,
     encoder: String,
+    codec: CodecKind,
+    chroma: Chroma,
+    slices: u32,
+    bitrate_kbps: Option<u32>,
     auth: AuthState,
     audio_device: Option<String>,
 }
@@ -54,6 +62,10 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         fps: cfg.fps,
         quality: cfg.quality,
         encoder: cfg.encoder,
+        codec: cfg.codec,
+        chroma: cfg.chroma,
+        slices: cfg.slices,
+        bitrate_kbps: cfg.bitrate_kbps,
         auth: auth_state.clone(),
         audio_device: cfg.audio_device,
     };
@@ -229,12 +241,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         width: screen_w,
         height: screen_h,
         fps: state.fps as u8,
+        codec: state.codec.protocol_id(),
     };
     log::info!(
-        "Sending ServerInfo: {}×{} @ {} fps (monitor {} at {}, {})",
+        "Sending ServerInfo: {}×{} @ {} fps, codec={:?} (id {}) (monitor {} at {}, {})",
         screen_w,
         screen_h,
         state.fps,
+        state.codec,
+        state.codec.protocol_id(),
         selected_monitor,
         mon_x,
         mon_y
@@ -269,6 +284,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let fps = state.fps;
     let quality = state.quality;
     let encoder_name = state.encoder.clone();
+    let codec = state.codec;
+    let chroma = state.chroma;
+    let slices = state.slices;
+    let bitrate_kbps = state.bitrate_kbps;
     let monitor_idx = selected_monitor;
 
     // ── 3. Spawn the capture + encode pipeline (blocking thread) ──
@@ -278,15 +297,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let cap_mon_h = screen_h as u32;
     let capture_handle = tokio::task::spawn_blocking(move || {
         if let Err(e) = capture_loop(
-            fps,
-            quality,
-            &encoder_name,
-            frame_tx,
-            monitor_idx,
-            cap_mon_x,
-            cap_mon_y,
-            cap_mon_w,
-            cap_mon_h,
+            CaptureLoopArgs {
+                fps,
+                quality,
+                encoder_name: &encoder_name,
+                codec,
+                chroma,
+                slices,
+                bitrate_kbps,
+                frame_tx,
+                monitor_index: monitor_idx,
+                monitor_x: cap_mon_x,
+                monitor_y: cap_mon_y,
+                monitor_w: cap_mon_w,
+                monitor_h: cap_mon_h,
+            },
         ) {
             log::error!("Capture loop error: {e}");
         }
@@ -509,23 +534,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let _ = input_handle.await;
 }
 
-/// Main capture → encode loop. Runs on a dedicated OS thread.
-///
-/// Cursor polling has been split off into its own task (see
-/// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
-/// to the encoder FPS.
-fn capture_loop(
+/// Bundled arguments for [`capture_loop`].  Avoids growing the
+/// function signature past sanity as we add encoder options.
+struct CaptureLoopArgs<'a> {
     fps: u32,
     quality: u8,
-    encoder_name: &str,
+    encoder_name: &'a str,
+    codec: CodecKind,
+    chroma: Chroma,
+    slices: u32,
+    bitrate_kbps: Option<u32>,
     frame_tx: mpsc::Sender<EncodedFrame>,
     monitor_index: usize,
     monitor_x: i32,
     monitor_y: i32,
     monitor_w: u32,
     monitor_h: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut capture = ScreenCapture::new_for_display(monitor_index)
+}
+
+/// Main capture → encode loop. Runs on a dedicated OS thread.
+///
+/// Cursor polling has been split off into its own task (see
+/// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
+/// to the encoder FPS.
+fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut capture = ScreenCapture::new_for_display(args.monitor_index)
         .or_else(|_| ScreenCapture::new())?;
     let w = capture.width();
     let h = capture.height();
@@ -534,19 +567,30 @@ fn capture_loop(
         "Capture initialized: {}×{} @ {} fps (monitor {} at {}, {})",
         w,
         h,
-        fps,
-        monitor_index,
-        monitor_x,
-        monitor_y
+        args.fps,
+        args.monitor_index,
+        args.monitor_x,
+        args.monitor_y
     );
     // monitor_w/h are passed in for symmetry with the cursor task; they
     // are not used directly here because the captured display already
     // reports its own dimensions.
-    let _ = (monitor_w, monitor_h);
+    let _ = (args.monitor_w, args.monitor_h);
 
-    let mut encoder = FfmpegEncoder::new(w, h, fps, quality, encoder_name, frame_tx)?;
+    let cfg = EncoderConfig {
+        width: w as u32,
+        height: h as u32,
+        fps: args.fps,
+        quality: args.quality,
+        encoder_name: args.encoder_name.to_string(),
+        codec: args.codec,
+        chroma: args.chroma,
+        slices: args.slices,
+        bitrate_kbps: args.bitrate_kbps,
+    };
+    let mut encoder = FfmpegEncoder::new(cfg, args.frame_tx)?;
 
-    let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
+    let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(args.fps));
     let boot = Instant::now();
     let mut frame_no: u64 = 0;
 
