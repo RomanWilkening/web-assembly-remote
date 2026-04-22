@@ -1323,12 +1323,14 @@ name = "wasm-remote-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "env_logger",
  "futures-util",
  "hex",
  "http",
  "log",
+ "memchr",
  "protocol",
  "rand",
  "scrap",

@@ -7,6 +7,10 @@ pub struct ScreenCapture {
     capturer: Capturer,
     width: u32,
     height: u32,
+    /// Persistent BGRA buffer reused across `capture_frame` calls so we
+    /// don't allocate ~33 MB (4K) on every frame.  Capacity is grown to
+    /// `width * height * 4` lazily on the first capture.
+    buf: Vec<u8>,
 }
 
 impl ScreenCapture {
@@ -17,7 +21,7 @@ impl ScreenCapture {
         let h = display.height() as u32;
         let capturer = Capturer::new(display)?;
         log::info!("Screen capture initialized: {}×{}", w, h);
-        Ok(Self { capturer, width: w, height: h })
+        Ok(Self { capturer, width: w, height: h, buf: Vec::new() })
     }
 
     /// Open a specific display by index.
@@ -37,7 +41,7 @@ impl ScreenCapture {
         let h = display.height() as u32;
         let capturer = Capturer::new(display)?;
         log::info!("Screen capture initialized for monitor {}: {}×{}", index, w, h);
-        Ok(Self { capturer, width: w, height: h })
+        Ok(Self { capturer, width: w, height: h, buf: Vec::new() })
     }
 
     pub fn width(&self) -> u32 {
@@ -49,31 +53,41 @@ impl ScreenCapture {
     }
 
     /// Capture a single frame. Returns tightly-packed BGRA pixel data
-    /// (stride == width × 4).
+    /// (stride == width × 4) as a borrowed slice into a buffer owned by
+    /// the capturer — valid until the next call to `capture_frame`.
     ///
     /// On Windows/DXGI the mapped surface may have a row pitch larger
     /// than `width * 4`. We strip the padding so FFmpeg receives the
     /// exact frame size it expects.
-    pub fn capture_frame(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn capture_frame(&mut self) -> Result<&[u8], Box<dyn std::error::Error>> {
         loop {
             match self.capturer.frame() {
                 Ok(frame) => {
                     let expected_stride = self.width as usize * 4;
                     let expected_size = expected_stride * self.height as usize;
 
-                    if frame.len() == expected_size {
-                        // No padding – fast path.
-                        return Ok(frame.to_vec());
-                    }
+                    // Reuse the persistent buffer; resize without
+                    // reallocating once it has reached `expected_size`.
+                    self.buf.clear();
+                    self.buf.reserve(expected_size);
 
-                    // Row pitch is larger than width×4 → strip padding.
-                    let actual_stride = frame.len() / self.height as usize;
-                    let mut packed = Vec::with_capacity(expected_size);
-                    for row in 0..self.height as usize {
-                        let start = row * actual_stride;
-                        packed.extend_from_slice(&frame[start..start + expected_stride]);
+                    if frame.len() == expected_size {
+                        // No padding – fast path: single copy into the
+                        // reusable buffer.
+                        self.buf.extend_from_slice(&frame);
+                    } else {
+                        // Row pitch is larger than width×4 → strip
+                        // padding row by row into the persistent buffer.
+                        let actual_stride = frame.len() / self.height as usize;
+                        for row in 0..self.height as usize {
+                            let start = row * actual_stride;
+                            self.buf
+                                .extend_from_slice(&frame[start..start + expected_stride]);
+                        }
                     }
-                    return Ok(packed);
+                    // Drop the scrap `Frame` borrow before returning a
+                    // borrow into `self.buf`.
+                    return Ok(&self.buf);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     // No new frame yet – yield briefly to avoid busy-waiting.

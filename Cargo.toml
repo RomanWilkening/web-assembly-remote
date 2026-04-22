@@ -1,3 +1,11 @@
 [workspace]
 members = ["protocol", "server", "client"]
 resolver = "2"
+
+# Release profile tuned for the server's hot loops (capture → AuDetector
+# → write).  `lto = "thin"` and `codegen-units = 1` typically buy a few
+# percent on this kind of throughput-bound code without blowing up build
+# time, and apply uniformly across all workspace members.
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -3,9 +3,22 @@ use std::process::{Child, Command, Stdio};
 use tokio::sync::mpsc;
 
 /// One encoded video frame ready to send to the client.
+///
+/// `data` is laid out so that the first 10 bytes are reserved for the
+/// `MSG_VIDEO_FRAME` wire header (`type u8 + timestamp_us u64 LE +
+/// is_keyframe u8`) and the remainder is the raw H.264 access-unit
+/// payload.  This lets the WebSocket sender fill in the header
+/// in-place and forward the whole `Vec` to `axum::Message::Binary`
+/// without any further copy of the (potentially multi-MB) H.264 data.
 pub struct EncodedFrame {
+    /// `[0..10]` reserved header, `[10..]` H.264 Annex-B payload.
     pub data: Vec<u8>,
     pub is_keyframe: bool,
+}
+
+impl EncodedFrame {
+    /// Length of the reserved header region.
+    pub const HEADER_LEN: usize = 10;
 }
 
 /// Manages an FFmpeg subprocess that accepts raw BGRA frames on stdin
@@ -187,6 +200,10 @@ impl AuDetector {
     }
 
     /// Append raw bytes and return any complete access units found.
+    ///
+    /// Each emitted `EncodedFrame` carries a payload `Vec<u8>` whose
+    /// first `EncodedFrame::HEADER_LEN` bytes are pre-reserved for the
+    /// wire header — see `EncodedFrame` docs.
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
@@ -200,10 +217,17 @@ impl AuDetector {
         while search + 3 < self.buf.len() {
             if let Some(aud_pos) = self.find_aud(search) {
                 if let Some(start) = prev_aud {
-                    let au_data = self.buf[start..aud_pos].to_vec();
-                    if !au_data.is_empty() {
-                        let is_key = Self::contains_idr(&au_data);
-                        frames.push(EncodedFrame { data: au_data, is_keyframe: is_key });
+                    let au_slice = &self.buf[start..aud_pos];
+                    if !au_slice.is_empty() {
+                        let is_key = Self::contains_idr(au_slice);
+                        // Allocate once with room for the wire header so
+                        // the sender doesn't need a second copy.
+                        let mut data = Vec::with_capacity(
+                            EncodedFrame::HEADER_LEN + au_slice.len(),
+                        );
+                        data.resize(EncodedFrame::HEADER_LEN, 0);
+                        data.extend_from_slice(au_slice);
+                        frames.push(EncodedFrame { data, is_keyframe: is_key });
                     }
                 }
                 prev_aud = Some(aud_pos);
@@ -213,26 +237,44 @@ impl AuDetector {
             }
         }
 
-        // Keep only unprocessed data in the buffer.
+        // Keep only unprocessed data in the buffer.  `drain` shifts the
+        // tail in place — no realloc, no extra copy of the (potentially
+        // large) leftover region.
         if let Some(start) = prev_aud {
-            self.buf = self.buf[start..].to_vec();
+            if start > 0 {
+                self.buf.drain(..start);
+            }
         }
 
         frames
     }
 
     /// Find the byte offset of the next AUD start-code at or after `from`.
+    ///
+    /// Uses `memchr` to skip ahead to the next `0x00` byte (SIMD-accelerated
+    /// on x86_64) and only then validates the surrounding start-code
+    /// pattern.  This is dramatically faster on large I-frames than the
+    /// previous byte-by-byte scan.
     fn find_aud(&self, from: usize) -> Option<usize> {
         let d = &self.buf;
         let mut i = from;
         while i + 3 < d.len() {
-            if d[i] == 0 && d[i + 1] == 0 {
-                // 4-byte start-code
-                if i + 4 < d.len() && d[i + 2] == 0 && d[i + 3] == 1 && (d[i + 4] & 0x1F) == 9
+            // Jump to the next zero byte.
+            let rel = memchr::memchr(0, &d[i..d.len().saturating_sub(3)])?;
+            i += rel;
+            if i + 3 >= d.len() {
+                return None;
+            }
+            if d[i + 1] == 0 {
+                // 4-byte start-code: 00 00 00 01 <nal type 9>
+                if i + 4 < d.len()
+                    && d[i + 2] == 0
+                    && d[i + 3] == 1
+                    && (d[i + 4] & 0x1F) == 9
                 {
                     return Some(i);
                 }
-                // 3-byte start-code
+                // 3-byte start-code: 00 00 01 <nal type 9>
                 if d[i + 2] == 1 && (d[i + 3] & 0x1F) == 9 {
                     return Some(i);
                 }
@@ -264,5 +306,65 @@ impl AuDetector {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal Annex-B fragment: AUD (4-byte SC, type 9) +
+    /// `payload` bytes (the slice should not contain another AUD start).
+    fn aud_au(payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x00, 0x01, 0x09]; // AUD
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn detects_two_access_units_split_on_aud() {
+        let mut det = AuDetector::new();
+        // Two AUs back-to-back: AUD | non-IDR slice (type 1)
+        //                     + AUD | IDR slice     (type 5)
+        let mut bytes = aud_au(&[0x00, 0x00, 0x01, 0x41, 0xaa]); // type 1 (P/B)
+        bytes.extend_from_slice(&aud_au(&[0x00, 0x00, 0x01, 0x65, 0xbb])); // type 5 (IDR)
+        // Trailing AUD so the second AU is closed.
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09]);
+
+        let frames = det.push(&bytes);
+        assert_eq!(frames.len(), 2);
+        assert!(!frames[0].is_keyframe);
+        assert!(frames[1].is_keyframe);
+        // Each emitted frame must reserve the 10-byte wire header.
+        for f in &frames {
+            assert!(f.data.len() >= EncodedFrame::HEADER_LEN);
+            // Header bytes start out zeroed.
+            assert!(f.data[..EncodedFrame::HEADER_LEN].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn handles_streaming_chunks_without_losing_data() {
+        // Same bytes as above, fed one byte at a time.  Stresses the
+        // `drain`-based leftover handling.
+        let mut det = AuDetector::new();
+        let mut bytes = aud_au(&[0x00, 0x00, 0x01, 0x41, 0xaa]);
+        bytes.extend_from_slice(&aud_au(&[0x00, 0x00, 0x01, 0x65, 0xbb]));
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09]);
+
+        let mut got = Vec::new();
+        for b in &bytes {
+            got.extend(det.push(std::slice::from_ref(b)));
+        }
+        assert_eq!(got.len(), 2);
+        assert!(!got[0].is_keyframe);
+        assert!(got[1].is_keyframe);
+    }
+
+    #[test]
+    fn no_aud_means_no_frames_emitted() {
+        let mut det = AuDetector::new();
+        let frames = det.push(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xff, 0xff]);
+        assert!(frames.is_empty());
     }
 }

@@ -558,11 +558,19 @@ async function main() {
       console.error('WebSocket error:', e);
     });
 
+    // Reusable DataView over the current message – avoids constructing a
+    // new view per packet just to read the small header fields.
+    let dv = null;
+    let dvBuffer = null;
+
     ws.addEventListener('message', (event) => {
       const data = new Uint8Array(event.data);
       if (data.length === 0) return;
 
-      const type_ = wasm.message_type(data);
+      // Read the message-type byte directly in JS to avoid the
+      // wasm-bindgen `&[u8]` copy of the entire payload (which for a
+      // 4K key-frame can be hundreds of KB).
+      const type_ = data[0];
 
       switch (type_) {
         case MSG_MONITOR_LIST: {
@@ -643,10 +651,21 @@ async function main() {
         }
 
         case MSG_VIDEO_FRAME: {
-          const tsUs      = wasm.video_frame_timestamp(data);
-          const isKey     = wasm.video_frame_is_keyframe(data);
-          const offset    = wasm.video_frame_data_offset();
-          const h264Data  = data.subarray(offset);
+          // Hot-path: parse the 10-byte header directly in JS so the
+          // multi-MB H.264 payload is never copied into wasm linear
+          // memory just to read a timestamp + 1-byte flag.
+          // Layout: [type u8][timestamp_us u64 LE][is_keyframe u8][h264 …]
+          if (data.length < 10) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          // u64 little-endian → number (microseconds fit in 53 bits for
+          // any realistic Unix-time value, so the f64 conversion is
+          // lossless in practice).
+          const tsUs   = Number(dv.getBigUint64(data.byteOffset + 1, true));
+          const isKey  = data[9] !== 0;
+          const h264Data = data.subarray(10);
 
           // Reset the stall-detection timer on every received frame.
           resetStallTimer();
@@ -664,7 +683,14 @@ async function main() {
           // sent in the matching Ping.  Compute the round-trip on the
           // client clock alone and report half of it as the one-way
           // latency estimate.
-          const sentUs = wasm.pong_client_ts(data);
+          // Pong layout: [type u8][client_ts_us u64 LE]; parse in JS to
+          // skip the wasm-bindgen copy for this small but frequent msg.
+          if (data.length < 9) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          const sentUs = Number(dv.getBigUint64(data.byteOffset + 1, true));
           const nowUs  = (performance.timeOrigin + performance.now()) * 1000;
           const rttMs  = (nowUs - sentUs) / 1000;
           if (rttMs >= 0 && rttMs < 60000) {
@@ -674,9 +700,15 @@ async function main() {
         }
 
         case MSG_CURSOR_INFO: {
-          const cx = wasm.cursor_info_x(data);
-          const cy = wasm.cursor_info_y(data);
-          const cv = wasm.cursor_info_visible(data);
+          // CursorInfo layout: [type u8][x u16 LE][y u16 LE][visible u8]
+          if (data.length < 6) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          const cx = dv.getUint16(data.byteOffset + 1, true);
+          const cy = dv.getUint16(data.byteOffset + 3, true);
+          const cv = data[5] !== 0;
           updateRemoteCursor(cx, cy, cv);
           break;
         }

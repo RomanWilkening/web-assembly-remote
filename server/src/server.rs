@@ -73,9 +73,14 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(cfg.addr).await?;
 
-    // Enable TCP_NODELAY on accepted connections for lower latency.
+    // Enable TCP_NODELAY on every accepted connection.  Without this,
+    // Nagle's algorithm can hold back small frames (cursor updates,
+    // pongs, audio chunks, small delta-frames) for up to 40 ms — a
+    // direct hit on the interactive latency path.
     log::info!("Listening on http://{}", cfg.addr);
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service())
+        .tcp_nodelay(true)
+        .await?;
 
     Ok(())
 }
@@ -355,39 +360,48 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         loop {
             tokio::select! {
-                Some(frame) = frame_rx.recv() => {
-                    let ts = timestamp_us();
-                    let msg = protocol::ServerMessage::VideoFrame {
-                        timestamp_us: ts,
-                        is_keyframe: frame.is_keyframe,
-                        data: frame.data,
-                    };
-                    let bin = msg.encode();
-                    if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
+                // `biased;` makes the select arms be polled in source
+                // order on every iteration.  We poll Pong first so RTT
+                // measurements are not delayed behind a large pending
+                // I-frame, then the rest of the small/control messages
+                // before the (potentially large) video stream.
+                biased;
+
+                Some(client_ts_us) = pong_rx.recv() => {
+                    let bin = protocol::ServerMessage::Pong { client_ts_us }.encode();
+                    if ws_tx.send(Message::Binary(bin)).await.is_err() {
                         break;
                     }
                 }
                 Some(cursor_msg) = cursor_rx.recv() => {
                     let bin = cursor_msg.encode();
-                    if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
+                    if ws_tx.send(Message::Binary(bin)).await.is_err() {
                         break;
                     }
                 }
                 Some(audio_data) = audio_rx.recv() => {
                     let msg = protocol::ServerMessage::AudioData { data: audio_data };
                     let bin = msg.encode();
-                    if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Some(client_ts_us) = pong_rx.recv() => {
-                    let bin = protocol::ServerMessage::Pong { client_ts_us }.encode();
-                    if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
+                    if ws_tx.send(Message::Binary(bin)).await.is_err() {
                         break;
                     }
                 }
                 _ = ping_interval.tick() => {
-                    if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(mut frame) = frame_rx.recv() => {
+                    // Fill the 10 reserved header bytes of the AU buffer
+                    // in place; this avoids a second copy of the H.264
+                    // payload that the previous `ServerMessage::encode()`
+                    // path performed.
+                    debug_assert!(frame.data.len() >= EncodedFrame::HEADER_LEN);
+                    let ts = timestamp_us().to_le_bytes();
+                    frame.data[0] = protocol::MSG_VIDEO_FRAME;
+                    frame.data[1..9].copy_from_slice(&ts);
+                    frame.data[9] = u8::from(frame.is_keyframe);
+                    if ws_tx.send(Message::Binary(frame.data)).await.is_err() {
                         break;
                     }
                 }
@@ -485,7 +499,7 @@ fn capture_loop(
         }
 
         let bgra = capture.capture_frame()?;
-        encoder.send_frame(&bgra)?;
+        encoder.send_frame(bgra)?;
 
         // Send cursor position (only when it changes or every ~10 frames).
         let (abs_cx, abs_cy, visible) = cursor::get_cursor_position();
