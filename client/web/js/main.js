@@ -19,6 +19,7 @@ const MSG_CURSOR_INFO        = 0x03;
 const MSG_MONITOR_LIST       = 0x04;
 const MSG_AUDIO_DATA         = 0x05;
 const MSG_AUDIO_DEVICE_LIST  = 0x06;
+const MSG_PONG               = 0x07;
 
 // ---------------------------------------------------------------------------
 // WASM loading with explicit fetch, timeout, and retry.
@@ -254,6 +255,23 @@ async function main() {
       latencyEl.textContent = `Latency: ${avg} ms  (min ${min} / max ${max})`;
     }
   }, 500);
+
+  // Periodic Ping → Pong RTT measurement.  Computing RTT entirely on
+  // the client clock avoids any dependency on the server and browser
+  // system clocks being NTP-synchronised; the previously used
+  // (now - server_ts) calculation reported the clock skew between the
+  // two machines (often hundreds of milliseconds) on top of the real
+  // latency.  We send a ping every second and report RTT/2 as the
+  // approximate one-way latency.
+  setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const nowUs = (performance.timeOrigin + performance.now()) * 1000;
+    try {
+      send(wasm.encode_ping(nowUs));
+    } catch (e) {
+      // wasm not loaded yet or send failed – ignore.
+    }
+  }, 1000);
 
   // Latency display toggle (off by default).
   toggleLatency.checked = latencyVisible;
@@ -633,14 +651,25 @@ async function main() {
           // Reset the stall-detection timer on every received frame.
           resetStallTimer();
 
-          // Measure one-way latency (approximate, requires synchronised clocks).
-          const nowUs = performance.now() * 1000 + performance.timeOrigin * 1000;
-          const latencyMs = (nowUs - tsUs) / 1000;
-          if (latencyMs > 0 && latencyMs < 60000) {
-            latencyTracker.record(latencyMs);
-          }
+          // NOTE: Latency is measured separately via Ping/Pong (see the
+          // periodic pinger above and the MSG_PONG handler below) so it
+          // doesn't depend on server/client wall-clock synchronisation.
 
           decoder.decode(h264Data, isKey, tsUs);
+          break;
+        }
+
+        case MSG_PONG: {
+          // RTT measurement: the server echoes back the timestamp we
+          // sent in the matching Ping.  Compute the round-trip on the
+          // client clock alone and report half of it as the one-way
+          // latency estimate.
+          const sentUs = wasm.pong_client_ts(data);
+          const nowUs  = (performance.timeOrigin + performance.now()) * 1000;
+          const rttMs  = (nowUs - sentUs) / 1000;
+          if (rttMs >= 0 && rttMs < 60000) {
+            latencyTracker.record(rttMs / 2);
+          }
           break;
         }
 

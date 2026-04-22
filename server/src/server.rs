@@ -248,6 +248,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Channel: audio device control (None = stop, Some(name) = start).
     let (audio_ctl_tx, mut audio_ctl_rx) = mpsc::channel::<Option<String>>(4);
 
+    // Channel: ping replies (filled by the receiver, drained by the sender).
+    let (pong_tx, mut pong_rx) = mpsc::channel::<u64>(8);
+
     let fps = state.fps;
     let quality = state.quality;
     let encoder_name = state.encoder.clone();
@@ -377,6 +380,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     }
                 }
+                Some(client_ts_us) = pong_rx.recv() => {
+                    let bin = protocol::ServerMessage::Pong { client_ts_us }.encode();
+                    if ws_tx.send(Message::Binary(bin.into())).await.is_err() {
+                        break;
+                    }
+                }
                 _ = ping_interval.tick() => {
                     if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
                         break;
@@ -391,19 +400,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Binary(data) => {
-                // Intercept audio device selection before forwarding to
-                // the input handler, because it needs async handling.
-                if let Some(protocol::ClientMessage::SelectAudio { index }) =
-                    protocol::ClientMessage::decode(&data)
-                {
-                    let cmd = if index == 0xFF {
-                        None
-                    } else {
-                        audio_devices.get(index as usize).cloned()
-                    };
-                    let _ = audio_ctl_tx.send(cmd).await;
-                } else {
-                    let _ = input_tx.try_send(data.to_vec());
+                // Intercept messages that need special async handling
+                // (audio device selection, ping/pong) before forwarding to
+                // the input handler.
+                match protocol::ClientMessage::decode(&data) {
+                    Some(protocol::ClientMessage::SelectAudio { index }) => {
+                        let cmd = if index == 0xFF {
+                            None
+                        } else {
+                            audio_devices.get(index as usize).cloned()
+                        };
+                        let _ = audio_ctl_tx.send(cmd).await;
+                    }
+                    Some(protocol::ClientMessage::Ping { client_ts_us }) => {
+                        // Echo back as Pong so the client can compute RTT
+                        // against its own clock (no NTP sync required).
+                        let _ = pong_tx.try_send(client_ts_us);
+                    }
+                    _ => {
+                        let _ = input_tx.try_send(data.to_vec());
+                    }
                 }
             }
             Message::Close(_) => break,
@@ -414,6 +430,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     log::info!("WebSocket client disconnected");
     drop(input_tx);
     drop(audio_ctl_tx);
+    drop(pong_tx);
     capture_handle.abort();
     audio_ctl_handle.abort();
     let _ = send_handle.await;

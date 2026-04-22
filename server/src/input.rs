@@ -57,6 +57,7 @@ impl InputSimulator {
             ClientMessage::SetKeyboardLayout { klid } => {
                 Self::set_keyboard_layout(klid);
             }
+            ClientMessage::Ping { .. } => { /* handled by server */ }
         }
     }
 

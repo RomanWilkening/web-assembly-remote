@@ -4,8 +4,8 @@ use wasm_bindgen::prelude::*;
 pub use protocol::{
     MSG_AUDIO_DATA, MSG_AUDIO_DEVICE_LIST, MSG_CLIENT_READY, MSG_CURSOR_INFO, MSG_KEY_EVENT,
     MSG_KEY_SCANCODE, MSG_MONITOR_LIST, MSG_MOUSE_BUTTON, MSG_MOUSE_MOVE, MSG_MOUSE_SCROLL,
-    MSG_SELECT_AUDIO, MSG_SELECT_MONITOR, MSG_SERVER_INFO, MSG_SET_KEYBOARD_LAYOUT,
-    MSG_VIDEO_FRAME,
+    MSG_PING, MSG_PONG, MSG_SELECT_AUDIO, MSG_SELECT_MONITOR, MSG_SERVER_INFO,
+    MSG_SET_KEYBOARD_LAYOUT, MSG_VIDEO_FRAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +64,24 @@ pub fn encode_select_audio(index: u8) -> Vec<u8> {
     protocol::ClientMessage::SelectAudio { index }.encode()
 }
 
+/// Encode a `Ping` client message containing a client-supplied
+/// timestamp (microseconds, opaque to the server). The server echoes
+/// it back as `Pong`, allowing the client to compute round-trip time
+/// using only its own clock.
+///
+/// `client_ts_us` is `f64` because JavaScript numbers are doubles;
+/// any value in the realistic Unix-microsecond range fits losslessly
+/// in 53 bits of mantissa.
+#[wasm_bindgen]
+pub fn encode_ping(client_ts_us: f64) -> Vec<u8> {
+    let ts = if client_ts_us.is_finite() && client_ts_us >= 0.0 {
+        client_ts_us as u64
+    } else {
+        0
+    };
+    protocol::ClientMessage::Ping { client_ts_us: ts }.encode()
+}
+
 // ---------------------------------------------------------------------------
 // Decode helpers – called from JavaScript to parse incoming server messages.
 // ---------------------------------------------------------------------------
@@ -99,6 +117,18 @@ pub fn video_frame_is_keyframe(data: &[u8]) -> bool {
 #[wasm_bindgen]
 pub fn video_frame_data_offset() -> usize {
     10
+}
+
+/// For a Pong message, extract the echoed client timestamp
+/// (microseconds, exactly the value that was sent in the Ping).
+/// Returns 0 for a malformed message.
+#[wasm_bindgen]
+pub fn pong_client_ts(data: &[u8]) -> f64 {
+    if data.len() < 9 || data[0] != MSG_PONG {
+        return 0.0;
+    }
+    let ts = u64::from_le_bytes(data[1..9].try_into().unwrap_or_default());
+    ts as f64
 }
 
 /// For a ServerInfo message, extract width.

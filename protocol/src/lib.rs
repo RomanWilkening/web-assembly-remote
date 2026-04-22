@@ -12,6 +12,7 @@ pub const MSG_CURSOR_INFO: u8 = 0x03;
 pub const MSG_MONITOR_LIST: u8 = 0x04;
 pub const MSG_AUDIO_DATA: u8 = 0x05;
 pub const MSG_AUDIO_DEVICE_LIST: u8 = 0x06;
+pub const MSG_PONG: u8 = 0x07;
 
 // Client → Server
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -23,6 +24,7 @@ pub const MSG_SELECT_MONITOR: u8 = 0x15;
 pub const MSG_SELECT_AUDIO: u8 = 0x16;
 pub const MSG_KEY_SCANCODE: u8 = 0x17;
 pub const MSG_SET_KEYBOARD_LAYOUT: u8 = 0x18;
+pub const MSG_PING: u8 = 0x19;
 
 // --- Monitor info ---
 
@@ -91,6 +93,14 @@ pub enum ServerMessage {
     AudioDeviceList {
         devices: Vec<AudioDeviceInfo>,
     },
+    /// Reply to a client `Ping`. Echoes the client's timestamp verbatim
+    /// so the client can compute round-trip time using only its own
+    /// monotonic clock (no NTP / clock-sync between server and browser
+    /// required).
+    Pong {
+        /// The exact value the client sent in `ClientMessage::Ping`.
+        client_ts_us: u64,
+    },
 }
 
 // --- Client messages ---
@@ -119,6 +129,10 @@ pub enum ClientMessage {
     /// on the remote. `klid` is a Windows Keyboard-Layout-ID such as
     /// `0x0000_0407` (de-DE) or `0x0000_0409` (en-US).
     SetKeyboardLayout { klid: u32 },
+    /// Round-trip-time measurement request. The server replies with
+    /// `ServerMessage::Pong` echoing `client_ts_us` verbatim so the
+    /// client can compute RTT against its own clock.
+    Ping { client_ts_us: u64 },
 }
 
 // --- Encoding ---
@@ -184,6 +198,12 @@ impl ServerMessage {
                 }
                 buf
             }
+            ServerMessage::Pong { client_ts_us } => {
+                let mut buf = Vec::with_capacity(1 + 8);
+                buf.push(MSG_PONG);
+                buf.extend_from_slice(&client_ts_us.to_le_bytes());
+                buf
+            }
         }
     }
 }
@@ -242,6 +262,12 @@ impl ClientMessage {
                 let mut buf = Vec::with_capacity(5);
                 buf.push(MSG_SET_KEYBOARD_LAYOUT);
                 buf.extend_from_slice(&klid.to_le_bytes());
+                buf
+            }
+            ClientMessage::Ping { client_ts_us } => {
+                let mut buf = Vec::with_capacity(1 + 8);
+                buf.push(MSG_PING);
+                buf.extend_from_slice(&client_ts_us.to_le_bytes());
                 buf
             }
         }
@@ -322,6 +348,10 @@ impl ServerMessage {
                 }
                 Some(ServerMessage::AudioDeviceList { devices })
             }
+            MSG_PONG if data.len() >= 9 => {
+                let client_ts_us = u64::from_le_bytes(data[1..9].try_into().ok()?);
+                Some(ServerMessage::Pong { client_ts_us })
+            }
             _ => None,
         }
     }
@@ -371,6 +401,10 @@ impl ClientMessage {
             MSG_SET_KEYBOARD_LAYOUT if data.len() >= 5 => {
                 let klid = u32::from_le_bytes(data[1..5].try_into().ok()?);
                 Some(ClientMessage::SetKeyboardLayout { klid })
+            }
+            MSG_PING if data.len() >= 9 => {
+                let client_ts_us = u64::from_le_bytes(data[1..9].try_into().ok()?);
+                Some(ClientMessage::Ping { client_ts_us })
             }
             _ => None,
         }
@@ -478,6 +512,22 @@ mod tests {
         let encoded = msg.encode();
         match ClientMessage::decode(&encoded).unwrap() {
             ClientMessage::SetKeyboardLayout { klid } => assert_eq!(klid, 0x0000_0407),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_ping_pong() {
+        let ts = 1_700_000_000_000_000_u64;
+        let encoded = ClientMessage::Ping { client_ts_us: ts }.encode();
+        match ClientMessage::decode(&encoded).unwrap() {
+            ClientMessage::Ping { client_ts_us } => assert_eq!(client_ts_us, ts),
+            _ => panic!("wrong variant"),
+        }
+
+        let encoded = ServerMessage::Pong { client_ts_us: ts }.encode();
+        match ServerMessage::decode(&encoded).unwrap() {
+            ServerMessage::Pong { client_ts_us } => assert_eq!(client_ts_us, ts),
             _ => panic!("wrong variant"),
         }
     }
