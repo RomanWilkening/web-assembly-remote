@@ -182,9 +182,16 @@ export class H264Decoder {
 
   /**
    * Compute the adaptive drop threshold from the most recent latency
-   * sample.  Bands chosen empirically: keep the queue deep on LAN-like
-   * latencies (≤ 20 ms one-way) and clamp aggressively on WAN/VPN
-   * links where every queued frame adds visible motion-to-photon lag.
+   * sample.  Bands chosen empirically:
+   *   * `< 20 ms` (LAN): allow up to 5 queued frames so brief jitter
+   *     never causes a drop — at this latency 5 frames ≈ 80 ms of
+   *     buffer which is invisible to the user.
+   *   * `20–60 ms` (typical WAN): 3 frames ≈ one half-second of buffer
+   *     at 60 fps; balances smoothness against motion-to-photon lag.
+   *   * `≥ 60 ms` (slow / congested): drop earlier (2 frames) because
+   *     each queued frame becomes a *visible* lag spike.
+   * The numbers are heuristics — tweak if profiling on a specific
+   * link suggests otherwise.
    * @private
    */
   _dropThreshold() {

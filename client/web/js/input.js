@@ -194,7 +194,11 @@ export class InputHandler {
         x = pos.x;
         y = pos.y;
       }
-      // Stash the most recent position; flush once per rAF.
+      // Stash the most recent position; flush once per rAF.  When the
+      // mouse moves multiple times within a single display frame the
+      // newer position simply overwrites the previous one — those
+      // intermediate samples are intentionally discarded because the
+      // encoder can only show one frame per refresh anyway.
       this._pendingMove = { x, y };
       if (this._moveRafId === 0) {
         this._moveRafId = requestAnimationFrame(() => {

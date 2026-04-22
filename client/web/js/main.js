@@ -262,10 +262,12 @@ async function main() {
   // (now - server_ts) calculation reported the clock skew between the
   // two machines (often hundreds of milliseconds) on top of the real
   // latency.  We send a ping every second and report RTT/2 as the
+  /** Wall-clock microseconds, monotonic enough for RTT measurement. */
+  const nowMicros = () => (performance.timeOrigin + performance.now()) * 1000;
   // approximate one-way latency.
   setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const nowUs = (performance.timeOrigin + performance.now()) * 1000;
+    const nowUs = nowMicros();
     try {
       send(wasm.encode_ping(nowUs));
     } catch (e) {
@@ -697,7 +699,7 @@ async function main() {
             dvBuffer = data.buffer;
           }
           const sentUs = Number(dv.getBigUint64(data.byteOffset + 1, true));
-          const nowUs  = (performance.timeOrigin + performance.now()) * 1000;
+          const nowUs  = nowMicros();
           const rttMs  = (nowUs - sentUs) / 1000;
           if (rttMs >= 0 && rttMs < 60000) {
             const oneWayMs = rttMs / 2;
