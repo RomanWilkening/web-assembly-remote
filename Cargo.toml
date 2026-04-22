@@ -9,3 +9,12 @@ resolver = "2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# WASM client: optimise for binary size (smaller .wasm = faster initial
+# load on the client, which is on the critical path of the user opening
+# the app).  The client crate only ships small encode helpers and the
+# latency tracker — there are no hot loops to gain from `opt-level = 3`.
+# `wasm-pack build --release` will additionally run `wasm-opt -O` on
+# top of these settings.
+[profile.release.package.wasm-remote-client]
+opt-level = "z"

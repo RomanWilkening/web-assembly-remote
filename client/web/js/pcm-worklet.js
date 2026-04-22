@@ -18,8 +18,16 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this._available = 0;
 
     this.port.onmessage = (e) => {
-      const samples = new Float32Array(e.data);
+      const buffer = e.data;
+      const samples = new Float32Array(buffer);
       const len = samples.length;
+      // Hand the underlying ArrayBuffer back to the main thread so it
+      // can be recycled instead of GC'd (see AudioPlayer._bufferPool).
+      // We do this *before* the early-return so even empty chunks are
+      // recycled rather than dropped on the floor.
+      try {
+        this.port.postMessage(buffer, [buffer]);
+      } catch (_) { /* ignore – worst case the main thread allocates */ }
       if (len === 0) return;
 
       // Run-length write: at most two contiguous segments (before and

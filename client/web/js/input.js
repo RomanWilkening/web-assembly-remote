@@ -113,9 +113,17 @@ export class InputHandler {
     /** @private */ this._remoteW = remoteWidth;
     /** @private */ this._remoteH = remoteHeight;
 
-    // Throttle mouse-move to at most once per frame (~16 ms).
-    /** @private */ this._lastMoveTime = 0;
-    /** @private */ this._moveThrottleMs = 8; // ~125 Hz max
+    // Coalesce mouse-move events to one send per display refresh
+    // (`requestAnimationFrame`).  This naturally tracks the encoder's
+    // FPS (so we don't burn bandwidth/CPU sending intermediate samples
+    // the encoder will throw away) and gives 144 Hz mice the same
+    // effective rate as the local display, instead of clipping to a
+    // fixed 125 Hz.  The very latest event always wins; older events
+    // in the same frame are simply replaced.
+    /** @private @type {{x:number,y:number}|null} */
+    this._pendingMove = null;
+    /** @private */
+    this._moveRafId = 0;
 
     // Pointer lock state
     /** @private */ this._pointerLocked = false;
@@ -176,10 +184,6 @@ export class InputHandler {
 
     // ── Mouse ──
     c.addEventListener('mousemove', (e) => {
-      const now = performance.now();
-      if (now - this._lastMoveTime < this._moveThrottleMs) return;
-      this._lastMoveTime = now;
-
       let x, y;
       if (this._pointerLocked) {
         const pos = this._handlePointerLockMove(e.movementX, e.movementY);
@@ -190,7 +194,18 @@ export class InputHandler {
         x = pos.x;
         y = pos.y;
       }
-      this._send(this._wasm.encode_mouse_move(x, y));
+      // Stash the most recent position; flush once per rAF.
+      this._pendingMove = { x, y };
+      if (this._moveRafId === 0) {
+        this._moveRafId = requestAnimationFrame(() => {
+          this._moveRafId = 0;
+          const m = this._pendingMove;
+          if (m) {
+            this._pendingMove = null;
+            this._send(this._wasm.encode_mouse_move(m.x, m.y));
+          }
+        });
+      }
     });
 
     c.addEventListener('mousedown', (e) => {

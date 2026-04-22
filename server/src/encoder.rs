@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
 
 /// One encoded video frame ready to send to the client.
@@ -23,10 +24,28 @@ impl EncodedFrame {
 
 /// Manages an FFmpeg subprocess that accepts raw BGRA frames on stdin
 /// and produces an H.264 Annex-B byte-stream on stdout.
+///
+/// Frame writes are decoupled from the capture thread by a dedicated
+/// writer OS thread: `send_frame` only hands a `Vec<u8>` to a
+/// 1-slot synchronous channel and never blocks on the (potentially
+/// multi-millisecond) write/flush into FFmpeg's stdin.  When the
+/// encoder is busy and the slot is occupied the *previous* pending
+/// frame is dropped — so capture can keep collecting fresh DXGI frames
+/// at the source FPS instead of stalling behind a slow encoder.
 pub struct FfmpegEncoder {
     #[allow(dead_code)]
     process: Child,
-    stdin: BufWriter<std::process::ChildStdin>,
+    /// 1-slot bounded channel to the writer thread.  `Some(buf)` means
+    /// "encode this frame next"; an attempt to send into an already
+    /// occupied slot replaces the queued frame (newest wins, oldest
+    /// dropped).  `None` signals the writer to exit.
+    writer_tx: std_mpsc::SyncSender<Option<Vec<u8>>>,
+    /// Reusable scratch buffer that `send_frame` clones the BGRA slice
+    /// into before pushing to the writer channel.  Kept here so we can
+    /// recycle it across calls instead of allocating a fresh `Vec`
+    /// every frame.  Actual ownership transfer to the channel still
+    /// requires a `mem::take`.
+    writer_scratch: Vec<u8>,
 }
 
 impl FfmpegEncoder {
@@ -142,15 +161,98 @@ impl FfmpegEncoder {
                 h264_reader_loop(stdout, frame_tx);
             })?;
 
-        Ok(Self { process, stdin })
+        // Background writer thread: owns the BufWriter to FFmpeg's
+        // stdin so the (potentially multi-ms) write+flush never
+        // blocks the capture thread.  A 1-slot sync channel acts as
+        // backpressure: if the encoder is still digesting the
+        // previous frame, the *new* frame replaces it (capture-side
+        // newest-wins), preserving capture FPS at the cost of
+        // dropping intermediate frames.
+        let (writer_tx, writer_rx) = std_mpsc::sync_channel::<Option<Vec<u8>>>(1);
+        std::thread::Builder::new()
+            .name("ffmpeg-stdin".into())
+            .spawn(move || {
+                encoder_writer_loop(stdin, writer_rx);
+            })?;
+
+        Ok(Self {
+            process,
+            writer_tx,
+            writer_scratch: Vec::new(),
+        })
     }
 
-    /// Write one raw BGRA frame into FFmpeg's stdin.
+    /// Hand one raw BGRA frame off to the encoder writer thread.
+    ///
+    /// Non-blocking: if the writer is still draining the previous
+    /// frame the new frame replaces the queued one (newest-wins
+    /// backpressure) so the caller never stalls behind FFmpeg.  The
+    /// dropped frame is logged at trace level.
     pub fn send_frame(&mut self, bgra: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        self.stdin.write_all(bgra)?;
-        self.stdin.flush()?;
-        Ok(())
+        // Reuse our scratch Vec to avoid an allocation per call:
+        // clear it, copy in the BGRA bytes, then `take` to move
+        // ownership into the channel.
+        self.writer_scratch.clear();
+        self.writer_scratch.reserve(bgra.len());
+        self.writer_scratch.extend_from_slice(bgra);
+        let buf = std::mem::take(&mut self.writer_scratch);
+
+        match self.writer_tx.try_send(Some(buf)) {
+            Ok(()) => Ok(()),
+            Err(std_mpsc::TrySendError::Full(Some(buf))) => {
+                // Encoder is busy with the previous frame.  Drop the
+                // new one to keep capture latency at the source rate.
+                // We *could* alternatively block, but blocking the
+                // capture thread is exactly what this whole change is
+                // designed to avoid.
+                log::trace!("encoder busy – dropping frame");
+                // Recycle the buffer instead of letting it drop.
+                self.writer_scratch = buf;
+                self.writer_scratch.clear();
+                Ok(())
+            }
+            Err(std_mpsc::TrySendError::Full(None)) => Ok(()),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                Err("FFmpeg writer thread terminated".into())
+            }
+        }
     }
+}
+
+impl Drop for FfmpegEncoder {
+    fn drop(&mut self) {
+        // Best-effort: tell the writer thread to exit so it can flush
+        // and close stdin cleanly.  Ignore errors — the worst case is
+        // the process is already gone.
+        let _ = self.writer_tx.send(None);
+    }
+}
+
+/// Drain a 1-slot channel of BGRA frame buffers and push each one to
+/// FFmpeg's stdin.  Exits cleanly when the channel is closed or `None`
+/// is received.
+fn encoder_writer_loop(
+    mut stdin: BufWriter<std::process::ChildStdin>,
+    rx: std_mpsc::Receiver<Option<Vec<u8>>>,
+) {
+    while let Ok(msg) = rx.recv() {
+        let buf = match msg {
+            Some(b) => b,
+            None => {
+                log::debug!("encoder writer received shutdown");
+                break;
+            }
+        };
+        if let Err(e) = stdin.write_all(&buf) {
+            log::error!("FFmpeg stdin write failed: {e}");
+            break;
+        }
+        if let Err(e) = stdin.flush() {
+            log::error!("FFmpeg stdin flush failed: {e}");
+            break;
+        }
+    }
+    // Drop `stdin` to close the pipe — signals EOF to FFmpeg.
 }
 
 // ── H.264 Annex-B stream reader ────────────────────────────────────

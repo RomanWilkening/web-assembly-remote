@@ -179,10 +179,18 @@ fn run_wasapi_loopback(
 
         // Drain complete chunks from the queue and send them.
         while sample_queue.len() >= CHUNK_BYTES {
+            // `make_contiguous` returns a single &mut [u8] view of the
+            // queue's internal storage so we can copy CHUNK_BYTES out
+            // with a single memcpy instead of `pop_front()`-ing each
+            // byte.  At 96 kB/s this saves ~96k VecDeque pops per
+            // second; small but unambiguously a win on the audio
+            // hot-path.
             let mut chunk = vec![0u8; CHUNK_BYTES];
-            for byte in chunk.iter_mut() {
-                *byte = sample_queue.pop_front().unwrap();
+            {
+                let head = sample_queue.make_contiguous();
+                chunk.copy_from_slice(&head[..CHUNK_BYTES]);
             }
+            sample_queue.drain(..CHUNK_BYTES);
             if audio_tx.blocking_send(chunk).is_err() {
                 log::info!("Audio channel closed – stopping WASAPI loopback");
                 let _ = audio_client.stop_stream();

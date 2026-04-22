@@ -89,6 +89,16 @@ async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // Note: WebSocket per-message-deflate (`permessage-deflate`) is
+    // intentionally **not** negotiated here.  Our payload mix is:
+    //   * Video — already H.264-compressed; deflate makes it bigger.
+    //   * Audio — small interleaved-PCM chunks, ~7.5 kB each, also
+    //     not compressible enough to justify the per-chunk CPU cost
+    //     on both ends.
+    //   * Cursor / pong / control — too small for deflate to help.
+    // axum 0.7's WebSocketUpgrade does not enable compression by
+    // default, so this is a documentation-only reminder: do not
+    // turn it on without re-benchmarking.
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -272,7 +282,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             quality,
             &encoder_name,
             frame_tx,
-            cursor_tx,
             monitor_idx,
             cap_mon_x,
             cap_mon_y,
@@ -280,6 +289,54 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             cap_mon_h,
         ) {
             log::error!("Capture loop error: {e}");
+        }
+    });
+
+    // ── 3a. Cursor polling task (decoupled from capture FPS) ──
+    //
+    // Polling the cursor on its own 120 Hz tick (instead of once per
+    // captured video frame) gives the user a responsive cursor even
+    // at lower encoder FPS, *and* removes the redundant "send every
+    // 10 frames regardless of change" path: the client only sees
+    // updates when the cursor actually moves or its visibility
+    // changes, so total bandwidth doesn't go up.
+    let cursor_mon_x = mon_x;
+    let cursor_mon_y = mon_y;
+    let cursor_mon_w = screen_w as u32;
+    let cursor_mon_h = screen_h as u32;
+    let cursor_handle = tokio::task::spawn_blocking(move || {
+        let interval = std::time::Duration::from_micros(1_000_000 / 120);
+        let mut last_sent = (u16::MAX, u16::MAX, false);
+        loop {
+            let start = Instant::now();
+            let (abs_cx, abs_cy, visible) = cursor::get_cursor_position();
+            let (rel_cx, rel_cy, show) = cursor_to_monitor_relative(
+                abs_cx,
+                abs_cy,
+                visible,
+                cursor_mon_x,
+                cursor_mon_y,
+                cursor_mon_w,
+                cursor_mon_h,
+            );
+            let next = (rel_cx, rel_cy, show);
+            if next != last_sent {
+                last_sent = next;
+                let msg = protocol::ServerMessage::CursorInfo {
+                    x: rel_cx,
+                    y: rel_cy,
+                    visible: show,
+                };
+                if cursor_tx.blocking_send(msg).is_err() {
+                    // WebSocket closed.
+                    break;
+                }
+            }
+            // Sleep the remainder of the 120 Hz tick.  Catch-up if we
+            // overran (e.g. cursor_to_monitor_relative did some work).
+            if let Some(rem) = interval.checked_sub(start.elapsed()) {
+                std::thread::sleep(rem);
+            }
         }
     });
 
@@ -446,23 +503,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     drop(audio_ctl_tx);
     drop(pong_tx);
     capture_handle.abort();
+    cursor_handle.abort();
     audio_ctl_handle.abort();
     let _ = send_handle.await;
     let _ = input_handle.await;
 }
 
 /// Main capture → encode loop. Runs on a dedicated OS thread.
-/// Also sends cursor position updates alongside video frames.
 ///
-/// Cursor coordinates are converted from absolute virtual-desktop
-/// space to positions relative to the captured monitor so the client
-/// can overlay them correctly.
+/// Cursor polling has been split off into its own task (see
+/// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
+/// to the encoder FPS.
 fn capture_loop(
     fps: u32,
     quality: u8,
     encoder_name: &str,
     frame_tx: mpsc::Sender<EncodedFrame>,
-    cursor_tx: mpsc::Sender<protocol::ServerMessage>,
     monitor_index: usize,
     monitor_x: i32,
     monitor_y: i32,
@@ -483,13 +539,16 @@ fn capture_loop(
         monitor_x,
         monitor_y
     );
+    // monitor_w/h are passed in for symmetry with the cursor task; they
+    // are not used directly here because the captured display already
+    // reports its own dimensions.
+    let _ = (monitor_w, monitor_h);
 
     let mut encoder = FfmpegEncoder::new(w, h, fps, quality, encoder_name, frame_tx)?;
 
     let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
     let boot = Instant::now();
     let mut frame_no: u64 = 0;
-    let mut last_cursor = (0u16, 0u16, false);
 
     loop {
         let target = boot + frame_interval.mul_f64(frame_no as f64);
@@ -500,22 +559,6 @@ fn capture_loop(
 
         let bgra = capture.capture_frame()?;
         encoder.send_frame(bgra)?;
-
-        // Send cursor position (only when it changes or every ~10 frames).
-        let (abs_cx, abs_cy, visible) = cursor::get_cursor_position();
-        let (rel_cx, rel_cy, show) = cursor_to_monitor_relative(
-            abs_cx, abs_cy, visible, monitor_x, monitor_y, monitor_w, monitor_h,
-        );
-
-        if (rel_cx, rel_cy, show) != last_cursor || frame_no % 10 == 0 {
-            last_cursor = (rel_cx, rel_cy, show);
-            let cursor_msg = protocol::ServerMessage::CursorInfo {
-                x: rel_cx,
-                y: rel_cy,
-                visible: show,
-            };
-            let _ = cursor_tx.try_send(cursor_msg);
-        }
 
         frame_no += 1;
     }

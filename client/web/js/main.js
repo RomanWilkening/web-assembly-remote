@@ -628,9 +628,15 @@ async function main() {
         }
 
         case MSG_SERVER_INFO: {
-          const w   = wasm.server_info_width(data);
-          const h   = wasm.server_info_height(data);
-          const fps = wasm.server_info_fps(data);
+          // ServerInfo layout: [type u8][width u16 LE][height u16 LE][fps u8]
+          if (data.length < 6) break;
+          if (dvBuffer !== data.buffer) {
+            dv = new DataView(data.buffer);
+            dvBuffer = data.buffer;
+          }
+          const w   = dv.getUint16(data.byteOffset + 1, true);
+          const h   = dv.getUint16(data.byteOffset + 3, true);
+          const fps = data[5];
           console.log(`ServerInfo: ${w}×${h} @ ${fps} fps`);
           remoteW = w;
           remoteH = h;
@@ -694,7 +700,12 @@ async function main() {
           const nowUs  = (performance.timeOrigin + performance.now()) * 1000;
           const rttMs  = (nowUs - sentUs) / 1000;
           if (rttMs >= 0 && rttMs < 60000) {
-            latencyTracker.record(rttMs / 2);
+            const oneWayMs = rttMs / 2;
+            latencyTracker.record(oneWayMs);
+            // Feed the latency back to the decoder so it can adapt its
+            // queue-drop threshold (deeper queue on LAN, shallower on
+            // slow links).  See `H264Decoder._dropThreshold`.
+            decoder.setLatencyMs(oneWayMs);
           }
           break;
         }

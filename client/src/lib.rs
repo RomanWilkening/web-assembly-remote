@@ -84,110 +84,16 @@ pub fn encode_ping(client_ts_us: f64) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 // Decode helpers – called from JavaScript to parse incoming server messages.
+//
+// NOTE on the hot-path: small fixed-layout headers (VideoFrame, Pong,
+// CursorInfo, ServerInfo) are now parsed directly in JS via `DataView`
+// instead of routed through wasm-bindgen.  Each `&[u8]` parameter forces
+// wasm-bindgen to copy the *entire* `Uint8Array` into the WASM linear
+// memory — for a 4K key-frame that is hundreds of KB of needless memcpy
+// per frame.  The helpers below are kept only for messages that contain
+// variable-length nested data (monitor list, audio device list) where
+// implementing the parser in JS is more error-prone than worth.
 // ---------------------------------------------------------------------------
-
-/// Decode the first byte of a server message to determine its type.
-/// Returns the MSG_* constant, or 0 if invalid.
-#[wasm_bindgen]
-pub fn message_type(data: &[u8]) -> u8 {
-    data.first().copied().unwrap_or(0)
-}
-
-/// For a VideoFrame message, extract the 8-byte timestamp (microseconds).
-#[wasm_bindgen]
-pub fn video_frame_timestamp(data: &[u8]) -> f64 {
-    if data.len() < 10 || data[0] != MSG_VIDEO_FRAME {
-        return 0.0;
-    }
-    let ts = u64::from_le_bytes(data[1..9].try_into().unwrap_or_default());
-    ts as f64
-}
-
-/// For a VideoFrame message, return whether it is a key-frame.
-#[wasm_bindgen]
-pub fn video_frame_is_keyframe(data: &[u8]) -> bool {
-    if data.len() < 10 || data[0] != MSG_VIDEO_FRAME {
-        return false;
-    }
-    data[9] != 0
-}
-
-/// For a VideoFrame message, return the offset where H.264 data begins.
-/// The caller can use this to create a sub-view of the ArrayBuffer.
-#[wasm_bindgen]
-pub fn video_frame_data_offset() -> usize {
-    10
-}
-
-/// For a Pong message, extract the echoed client timestamp
-/// (microseconds, exactly the value that was sent in the Ping).
-/// Returns 0 for a malformed message.
-#[wasm_bindgen]
-pub fn pong_client_ts(data: &[u8]) -> f64 {
-    if data.len() < 9 || data[0] != MSG_PONG {
-        return 0.0;
-    }
-    let ts = u64::from_le_bytes(data[1..9].try_into().unwrap_or_default());
-    ts as f64
-}
-
-/// For a ServerInfo message, extract width.
-#[wasm_bindgen]
-pub fn server_info_width(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_SERVER_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[1..3].try_into().unwrap_or_default())
-}
-
-/// For a ServerInfo message, extract height.
-#[wasm_bindgen]
-pub fn server_info_height(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_SERVER_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[3..5].try_into().unwrap_or_default())
-}
-
-/// For a ServerInfo message, extract FPS.
-#[wasm_bindgen]
-pub fn server_info_fps(data: &[u8]) -> u8 {
-    if data.len() < 6 || data[0] != MSG_SERVER_INFO {
-        return 0;
-    }
-    data[5]
-}
-
-// ---------------------------------------------------------------------------
-// Cursor info decode helpers
-// ---------------------------------------------------------------------------
-
-/// For a CursorInfo message, extract X position.
-#[wasm_bindgen]
-pub fn cursor_info_x(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[1..3].try_into().unwrap_or_default())
-}
-
-/// For a CursorInfo message, extract Y position.
-#[wasm_bindgen]
-pub fn cursor_info_y(data: &[u8]) -> u16 {
-    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
-        return 0;
-    }
-    u16::from_le_bytes(data[3..5].try_into().unwrap_or_default())
-}
-
-/// For a CursorInfo message, extract visibility.
-#[wasm_bindgen]
-pub fn cursor_info_visible(data: &[u8]) -> bool {
-    if data.len() < 6 || data[0] != MSG_CURSOR_INFO {
-        return false;
-    }
-    data[5] != 0
-}
 
 // ---------------------------------------------------------------------------
 // Monitor list decode helpers
