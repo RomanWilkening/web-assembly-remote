@@ -101,6 +101,7 @@ async function main() {
   const btnFullscreen   = document.getElementById('btn-fullscreen');
   const btnPointerLock  = document.getElementById('btn-pointerlock');
   const btnStream       = document.getElementById('btn-stream');
+  const toggleLatency   = document.getElementById('toggle-latency');
   const audioSelect     = document.getElementById('audio-select');
   const btnMute         = document.getElementById('btn-mute');
   const btnLogout       = document.getElementById('btn-logout');
@@ -112,6 +113,14 @@ async function main() {
   let pointerLocked = false;
   let remoteW = 0;
   let remoteH = 0;
+  /** Last known remote cursor position (cached so we can re-show it after
+   *  the browser tab regains visibility, when no new MSG_CURSOR_INFO arrives
+   *  until the cursor moves on the remote machine). */
+  let lastCursorX = 0;
+  let lastCursorY = 0;
+  let lastCursorVisible = false;
+  /** Latency display visibility – off by default. */
+  let latencyVisible = false;
   /** Currently active monitor index (tracks what the server is capturing). */
   let currentMonitorIndex = 0;
   /** @type {WebSocket|null} */
@@ -213,8 +222,9 @@ async function main() {
   /** @type {InputHandler|null} */
   let inputHandler = null;
 
-  // Periodic latency display update.
+  // Periodic latency display update (only when the user has enabled it).
   setInterval(() => {
+    if (!latencyVisible) return;
     if (latencyTracker.count() > 0) {
       const avg = latencyTracker.average_ms().toFixed(1);
       const min = latencyTracker.min_ms().toFixed(1);
@@ -222,6 +232,16 @@ async function main() {
       latencyEl.textContent = `Latency: ${avg} ms  (min ${min} / max ${max})`;
     }
   }, 500);
+
+  // Latency display toggle (off by default).
+  toggleLatency.checked = latencyVisible;
+  toggleLatency.addEventListener('change', () => {
+    latencyVisible = toggleLatency.checked;
+    latencyEl.classList.toggle('hidden', !latencyVisible);
+    if (!latencyVisible) {
+      latencyEl.textContent = '';
+    }
+  });
 
   // ── 4. Toolbar toggle with Escape ────────────────────────────
   document.addEventListener('keydown', (e) => {
@@ -290,18 +310,41 @@ async function main() {
   // ── 7. Scale selector ────────────────────────────────────────
   scaleSelect.addEventListener('change', () => {
     applyScale(scaleSelect.value);
+    // Reposition the remote cursor for the new layout.
+    updateRemoteCursor(lastCursorX, lastCursorY, lastCursorVisible);
   });
 
   function applyScale(mode) {
     if (mode === 'fit') {
+      // Stretch to fill the viewport (may distort aspect ratio).
       canvas.style.width = '100vw';
       canvas.style.height = '100vh';
+    } else if (mode === 'fit-aspect') {
+      // Fit inside the viewport while preserving the original aspect ratio.
+      if (remoteW > 0 && remoteH > 0) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const scale = Math.min(vw / remoteW, vh / remoteH);
+        canvas.style.width  = `${Math.floor(remoteW * scale)}px`;
+        canvas.style.height = `${Math.floor(remoteH * scale)}px`;
+      } else {
+        canvas.style.width = '100vw';
+        canvas.style.height = '100vh';
+      }
     } else {
       const pct = parseInt(mode) / 100;
       canvas.style.width  = `${remoteW * pct}px`;
       canvas.style.height = `${remoteH * pct}px`;
     }
   }
+
+  // Re-apply the current scale when the viewport size changes so that
+  // the "Fit (keep aspect)" mode adapts to the new window dimensions
+  // and the cursor overlay stays aligned with the canvas.
+  window.addEventListener('resize', () => {
+    applyScale(scaleSelect.value);
+    updateRemoteCursor(lastCursorX, lastCursorY, lastCursorVisible);
+  });
 
   // ── 8. Stream start/stop ─────────────────────────────────────
   btnStream.addEventListener('click', () => {
@@ -387,6 +430,13 @@ async function main() {
 
   // ── 11. Remote cursor rendering ──────────────────────────────
   function updateRemoteCursor(cx, cy, visible) {
+    // Cache the latest known position so we can re-display the cursor
+    // after the tab regains focus, even if the remote machine has not
+    // sent another MSG_CURSOR_INFO update yet.
+    lastCursorX = cx;
+    lastCursorY = cy;
+    lastCursorVisible = visible;
+
     if (!visible || remoteW === 0 || remoteH === 0) {
       remoteCursor.classList.add('hidden');
       return;
@@ -402,6 +452,17 @@ async function main() {
 
     remoteCursor.style.transform = `translate(${px}px, ${py}px)`;
   }
+
+  // When the user switches back to this tab, the remote may not send a
+  // fresh CursorInfo until the cursor next moves – which leaves the
+  // overlay hidden while the local cursor is also hidden over the canvas.
+  // Re-apply the last known cursor position so the pointer reappears
+  // immediately on tab focus.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      updateRemoteCursor(lastCursorX, lastCursorY, lastCursorVisible);
+    }
+  });
 
   // ── 12. WebSocket connect ────────────────────────────────────
   function connect() {

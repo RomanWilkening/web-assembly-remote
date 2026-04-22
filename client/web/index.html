@@ -10,7 +10,7 @@
   <!-- Status overlay -->
   <div id="overlay">
     <p id="status">Connecting…</p>
-    <p id="latency"></p>
+    <p id="latency" class="hidden"></p>
   </div>
 
   <!-- Control toolbar (top-right, toggled with Escape) -->
@@ -25,6 +25,7 @@
       <label>Scale:</label>
       <select id="scale-select" title="Display scale">
         <option value="fit">Fit</option>
+        <option value="fit-aspect">Fit (keep aspect)</option>
         <option value="100">100%</option>
         <option value="75">75%</option>
         <option value="50">50%</option>
@@ -33,6 +34,9 @@
     <button id="btn-fullscreen" title="Toggle fullscreen (F11)">⛶ Fullscreen</button>
     <button id="btn-pointerlock" title="Lock mouse (Ctrl+Alt+M)">🔓 Lock Mouse</button>
     <button id="btn-stream" title="Stop/start stream">⏹ Stop</button>
+    <div class="toolbar-group">
+      <label><input type="checkbox" id="toggle-latency" /> Latency</label>
+    </div>
     <div class="toolbar-group">
       <label>Audio:</label>
       <select id="audio-select" title="Select audio device">
