@@ -54,8 +54,10 @@ async function loadWasm(timeoutMs = 15000) {
     });
     clearTimeout(timer);
     // Pass the Response directly to wasm-bindgen init() so it does not
-    // issue its own (potentially cacheable) fetch.
-    await wasmModule.default(response);
+    // issue its own (potentially cacheable) fetch.  Newer wasm-bindgen
+    // versions require an options object instead of a positional arg
+    // (positional usage logs a deprecation warning and may be removed).
+    await wasmModule.default({ module_or_path: response });
   } catch (e) {
     clearTimeout(timer);
     throw e;
