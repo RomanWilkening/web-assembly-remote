@@ -34,8 +34,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this._buf.set(samples.subarray(first), 0);
         this._writePos = len - first;
       } else {
-        this._writePos = wp + first;
-        if (this._writePos === size) this._writePos = 0;
+        this._writePos = (wp + first) % size;
       }
 
       this._available += len;
