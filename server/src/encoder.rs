@@ -831,9 +831,14 @@ impl FrameSplitter for HevcSplitter {
 // ── AV1 splitter (Low-Overhead Bitstream Format) ───────────────────
 
 /// AV1 OBU types we care about.  Defined by the AV1 spec, section 6.2.1.
+/// `OBU_FRAME` and `OBU_FRAME_HEADER` are kept as named constants for
+/// documentation even though the splitter only uses them implicitly via
+/// the `is_keyframe` heuristic on Sequence Header presence.
 const OBU_SEQUENCE_HEADER: u8 = 1;
 const OBU_TEMPORAL_DELIMITER: u8 = 2;
+#[allow(dead_code)]
 const OBU_FRAME_HEADER: u8 = 3;
+#[allow(dead_code)]
 const OBU_FRAME: u8 = 6;
 
 /// Splits an AV1 Low-Overhead Bitstream Format stream into access
@@ -861,6 +866,11 @@ impl Av1Splitter {
     /// Parse a LEB128 (variable-length unsigned integer, max 8 bytes
     /// per AV1 spec §4.10.5).  Returns `(value, byte_count)` or `None`
     /// if the buffer is truncated or the encoding is invalid.
+    ///
+    /// The 8-byte cap also makes the function trivially overflow-safe:
+    /// the highest shift used is `7 * 7 = 49` (during the 8th iteration
+    /// `shift` is set to 49 *after* the last shift), well below `u64`'s
+    /// 64-bit width — so no `shift >= 64` guard is needed.
     fn read_leb128(buf: &[u8]) -> Option<(u64, usize)> {
         let mut value: u64 = 0;
         let mut shift = 0u32;
@@ -948,11 +958,6 @@ impl Av1Splitter {
 
             pos = payload_end;
             last_complete_end = pos;
-
-            // Useful for static analysis; OBU_FRAME and OBU_FRAME_HEADER
-            // do not influence splitting here but we silence the
-            // unused-constant warning.
-            let _ = (OBU_FRAME, OBU_FRAME_HEADER);
         }
 
         // Emit one frame per pair of adjacent TDs.  The bytes between

@@ -7,7 +7,7 @@
  * 4. Controls: fullscreen, pointer lock, monitor select, start/stop, logout.
  */
 
-import { H264Decoder } from './decoder.js';
+import { VideoStreamDecoder } from './decoder.js';
 import { Renderer }     from './renderer.js';
 import { InputHandler }  from './input.js';
 import { AudioPlayer }   from './audio.js';
@@ -235,7 +235,7 @@ async function main() {
 
   // ── 3. Set up decoder + renderer + audio ──────────────────────
   const renderer = new Renderer(canvas);
-  const decoder  = new H264Decoder((frame) => renderer.drawFrame(frame));
+  const decoder  = new VideoStreamDecoder((frame) => renderer.drawFrame(frame));
   const latencyTracker = new wasm.LatencyTracker(120);
   const audioPlayer = new AudioPlayer();
 
@@ -630,7 +630,9 @@ async function main() {
         }
 
         case MSG_SERVER_INFO: {
-          // ServerInfo layout: [type u8][width u16 LE][height u16 LE][fps u8]
+          // ServerInfo layout (v2): [type u8][width u16 LE][height u16 LE][fps u8][codec u8]
+          // The codec byte was added in v2; older servers send only 6
+          // bytes and the missing field is interpreted as H.264 (= 0).
           if (data.length < 6) break;
           if (dvBuffer !== data.buffer) {
             dv = new DataView(data.buffer);
@@ -639,11 +641,13 @@ async function main() {
           const w   = dv.getUint16(data.byteOffset + 1, true);
           const h   = dv.getUint16(data.byteOffset + 3, true);
           const fps = data[5];
-          console.log(`ServerInfo: ${w}×${h} @ ${fps} fps`);
+          const codec = data.length >= 7 ? data[6] : 0;
+          console.log(`ServerInfo: ${w}×${h} @ ${fps} fps, codec=${codec}`);
           remoteW = w;
           remoteH = h;
           renderer.resize(w, h);
           decoder.setRemoteSize(w, h);
+          decoder.setCodec(codec);
 
           if (!inputHandler) {
             inputHandler = new InputHandler(canvas, wasm, send, w, h);

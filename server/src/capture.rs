@@ -90,8 +90,17 @@ impl ScreenCapture {
                     return Ok(&self.buf);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // No new frame yet – yield briefly to avoid busy-waiting.
-                    std::thread::sleep(Duration::from_millis(1));
+                    // No new frame yet – yield briefly to avoid
+                    // busy-waiting.  500 µs is short enough to be
+                    // invisible at any realistic FPS (1/60s ≈ 16.6 ms,
+                    // so this is < 4 % of a frame budget) and halves
+                    // the worst-case capture-side wakeup latency
+                    // compared to the previous 1 ms sleep.  scrap does
+                    // not expose DXGI's `AcquireNextFrame(timeout)`
+                    // blocking primitive — replacing scrap with a
+                    // direct DXGI binding to get true wait-on-update
+                    // semantics is tracked as a separate follow-up.
+                    std::thread::sleep(Duration::from_micros(500));
                 }
                 Err(e) => return Err(e.into()),
             }

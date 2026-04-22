@@ -7,15 +7,33 @@
  * shader then samples to RGBA.  Falls back to Canvas2D `drawImage` on
  * browsers where WebGL2 isn't available or texImage2D rejects the frame.
  *
- * Frames are coalesced through `requestAnimationFrame` so we paint at
- * most once per display refresh; rAF is only armed while a frame is
- * actually pending so the main thread stays idle when the remote
- * desktop has nothing to send.
+ * Two scheduling modes are supported:
+ *
+ *   * `lowLatency: true` (default) — paint immediately on
+ *     `drawFrame()`.  The GPU command is issued straight away so the
+ *     compositor can present at the very next display refresh.  When
+ *     two decoded frames arrive within the same vsync interval the
+ *     second simply overdraws the first; the wasted GPU draw call is
+ *     vanishingly cheap for our single-quad shader and the user only
+ *     ever sees the latest pixels anyway.
+ *
+ *   * `lowLatency: false` — coalesce through `requestAnimationFrame`
+ *     so we paint at most once per display refresh.  Slightly less CPU
+ *     when running well above the display refresh rate but trades up
+ *     to one vsync of extra latency.  Kept as an opt-out for power
+ *     profiling.
+ *
+ * In both modes only the latest pending frame is kept; older
+ * undelivered frames are `close()`d so the GPU surface pool isn't
+ * leaked.
  */
 
 export class Renderer {
-  /** @param {HTMLCanvasElement} canvas */
-  constructor(canvas) {
+  /**
+   * @param {HTMLCanvasElement} canvas
+   * @param {{lowLatency?: boolean}} [opts]
+   */
+  constructor(canvas, opts = {}) {
     /** @private */
     this._canvas = canvas;
     /** @private @type {VideoFrame|null} */
@@ -24,10 +42,15 @@ export class Renderer {
     this._animId = 0;
     /** @private */
     this._running = false;
+    /** @private */
+    this._lowLatency = opts.lowLatency !== false;
 
     /** @private @type {WebGL2Backend|Canvas2DBackend} */
     this._backend = WebGL2Backend.tryCreate(canvas) || new Canvas2DBackend(canvas);
-    console.log(`Renderer backend: ${this._backend.name}`);
+    console.log(
+      `Renderer backend: ${this._backend.name}` +
+      (this._lowLatency ? ' (low-latency, sync paint)' : ' (rAF-coalesced)'),
+    );
   }
 
   /**
@@ -54,6 +77,14 @@ export class Renderer {
     }
     this._pendingFrame = frame;
     this._running = true;
+
+    if (this._lowLatency) {
+      // Paint immediately so the GPU draw call hits the compositor
+      // before the next vsync window starts.  This shaves up to one
+      // refresh of latency vs. the rAF path.
+      this._render();
+      return;
+    }
 
     // Schedule a single rAF only if one isn't already queued.  This keeps
     // the rAF callback dormant when no new frames arrive (e.g. the remote
@@ -90,9 +121,10 @@ export class Renderer {
       }
       frame.close();
     }
-    // Re-arm rAF only if another frame arrived during the paint.  When
-    // the queue is empty we stay dormant until `drawFrame` is called.
-    if (this._running && this._pendingFrame) {
+    // Re-arm rAF only if another frame arrived during the paint AND
+    // we're in rAF-coalescing mode.  In low-latency mode `drawFrame`
+    // re-enters `_render` synchronously so no scheduling is needed.
+    if (!this._lowLatency && this._running && this._pendingFrame) {
       this._scheduleRender();
     }
   }

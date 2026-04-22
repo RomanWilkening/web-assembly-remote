@@ -263,8 +263,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    // Channel: encoder → WebSocket sender (small buffer to avoid latency).
-    let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(2);
+    // Channel: encoder → WebSocket sender.  Capacity 4 is large enough to
+    // absorb a brief WebSocket-write stall (e.g. a slow Wi-Fi burst) so
+    // the encoder thread doesn't block on `send()`, but small enough that
+    // the *send-side* coalescer (see below) can keep latency low by
+    // dropping intermediate delta frames whenever the link is the
+    // bottleneck.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(4);
 
     // Channel: WebSocket receiver → input handler.
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -473,18 +478,65 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     }
                 }
-                Some(mut frame) = frame_rx.recv() => {
-                    // Fill the 10 reserved header bytes of the AU buffer
-                    // in place; this avoids a second copy of the H.264
-                    // payload that the previous `ServerMessage::encode()`
-                    // path performed.
-                    debug_assert!(frame.data.len() >= EncodedFrame::HEADER_LEN);
-                    let ts = timestamp_us().to_le_bytes();
-                    frame.data[0] = protocol::MSG_VIDEO_FRAME;
-                    frame.data[1..9].copy_from_slice(&ts);
-                    frame.data[9] = u8::from(frame.is_keyframe);
-                    if ws_tx.send(Message::Binary(frame.data)).await.is_err() {
-                        break;
+                Some(frame) = frame_rx.recv() => {
+                    // ── Send-side newest-wins coalescing ────────────────
+                    //
+                    // If multiple frames piled up in the channel while the
+                    // previous WebSocket write was in flight (typical on a
+                    // congested Wi-Fi or after a TCP retransmit) we want
+                    // to discard the *intermediate* delta frames and only
+                    // ship the most recent picture — the user only sees
+                    // the latest frame anyway, and dropping the stale
+                    // ones recovers latency immediately.
+                    //
+                    // Key-frames are NEVER dropped: losing one would leave
+                    // the decoder unable to recover until the next IDR
+                    // (~2 s with the current GOP), which is far worse
+                    // than carrying one extra frame of delay.
+                    //
+                    // Pending state is tracked as `Option<EncodedFrame>`
+                    // so we can keep the latest of each kind without an
+                    // intermediate placeholder allocation.
+                    let mut pending_key: Option<EncodedFrame> = None;
+                    let mut pending_delta: Option<EncodedFrame> = None;
+                    if frame.is_keyframe {
+                        pending_key = Some(frame);
+                    } else {
+                        pending_delta = Some(frame);
+                    }
+                    while let Ok(next) = frame_rx.try_recv() {
+                        if next.is_keyframe {
+                            // Newer key supersedes any earlier key.
+                            pending_key = Some(next);
+                        } else {
+                            // Newer delta supersedes any earlier delta.
+                            pending_delta = Some(next);
+                        }
+                    }
+
+                    // Send the (possibly skipped-ahead) key frame first
+                    // so the decoder can consume it before the latest
+                    // delta.
+                    if let Some(mut kf) = pending_key {
+                        debug_assert!(kf.data.len() >= EncodedFrame::HEADER_LEN);
+                        let ts = timestamp_us().to_le_bytes();
+                        kf.data[0] = protocol::MSG_VIDEO_FRAME;
+                        kf.data[1..9].copy_from_slice(&ts);
+                        kf.data[9] = u8::from(kf.is_keyframe);
+                        if ws_tx.send(Message::Binary(kf.data)).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    if let Some(mut df) = pending_delta {
+                        debug_assert!(df.data.len() >= EncodedFrame::HEADER_LEN);
+                        let ts = timestamp_us().to_le_bytes();
+                        df.data[0] = protocol::MSG_VIDEO_FRAME;
+                        df.data[1..9].copy_from_slice(&ts);
+                        df.data[9] = u8::from(df.is_keyframe);
+                        if ws_tx.send(Message::Binary(df.data)).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 else => break,
@@ -578,8 +630,8 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
     let _ = (args.monitor_w, args.monitor_h);
 
     let cfg = EncoderConfig {
-        width: w as u32,
-        height: h as u32,
+        width: w,
+        height: h,
         fps: args.fps,
         quality: args.quality,
         encoder_name: args.encoder_name.to_string(),
