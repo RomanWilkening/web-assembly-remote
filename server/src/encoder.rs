@@ -271,6 +271,24 @@ impl FfmpegEncoder {
                     "-quality", "speed",
                     // See the comment on h264_amf above — same quirk.
                     "-forced_idr", "1",
+                    // Repeat VPS/SPS/PPS in-band before every IDR.
+                    //
+                    // hevc_amf's default `header_insertion_mode=none`
+                    // puts parameter sets only in `extradata`, never
+                    // in the bitstream.  Our `-bsf:v
+                    // hevc_metadata=aud=insert` post-filter walks the
+                    // bitstream looking for VPS/SPS/PPS to compute AUD
+                    // placement and aborts the encode with "VPS id 0
+                    // not available / Failed to read unit 0 (type 33)"
+                    // when none are present (observed on real
+                    // RX hardware, see commit message).  Switching to
+                    // `idr` makes hevc_amf prepend the parameter-set
+                    // bundle to every IDR access unit, which is also
+                    // what the WebCodecs HEVC decoder needs to pick up
+                    // a stream mid-flight (annexb-with-headers, no
+                    // out-of-band hvcC).  Tiny per-IDR overhead
+                    // (~80 bytes / 1 s at 60 fps).
+                    "-header_insertion_mode", "idr",
                 ]);
                 amf_rc(&mut cmd, &["-qp_i", "-qp_p"]);
                 cmd.args([
@@ -519,7 +537,12 @@ impl FfmpegEncoder {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     match line {
-                        Ok(l) if !l.is_empty() => log::warn!("FFmpeg: {l}"),
+                        Ok(l) if !l.is_empty() => {
+                            log::warn!("FFmpeg: {l}");
+                            if let Some(hint) = ffmpeg_stderr_hint(&l) {
+                                log::error!("Hint: {hint}");
+                            }
+                        }
                         Err(e) => {
                             log::debug!("FFmpeg stderr read error: {e}");
                             break;
@@ -636,6 +659,58 @@ fn encoder_writer_loop(
         }
     }
     // Drop `stdin` to close the pipe — signals EOF to FFmpeg.
+}
+
+// ── FFmpeg stderr → actionable hint ────────────────────────────────
+
+/// Translate a single line of FFmpeg stderr into a one-line operator
+/// hint when the message corresponds to a known, non-obvious failure
+/// mode that the raw text doesn't fully explain.
+///
+/// Returns `None` when the line is just normal FFmpeg progress / info
+/// noise — we don't want to spam a hint per line.
+///
+/// Kept as a free function (not a method) so it can be unit-tested
+/// without spinning up a real FFmpeg process.
+pub(crate) fn ffmpeg_stderr_hint(line: &str) -> Option<&'static str> {
+    // av1_amf failing with AMF error 30 (`AMF_NOT_SUPPORTED`) means
+    // the GPU/driver does not expose an AV1 hardware encoder.  This is
+    // a per-card capability — AMD added AV1 encode in RDNA3 (RX 7000),
+    // NVIDIA in Ada Lovelace (RTX 4000), Intel in Arc Alchemist.  Older
+    // hardware can't be made to support it, so the only useful action
+    // for the operator is to switch encoder.
+    if line.contains("CreateComponent(AMFVideoEncoderHW_AV1) failed") {
+        return Some(
+            "av1_amf is not supported by this GPU/driver (AMD requires RDNA3 / RX 7000+). \
+             Switch to --encoder hevc_amf, --encoder h264_amf, or a software AV1 \
+             encoder such as --encoder libsvtav1.",
+        );
+    }
+
+    // Same idea for NVENC.
+    if line.contains("OpenEncodeSessionEx failed: unsupported device")
+        || line.contains("Cannot load nvEncodeAPI")
+    {
+        return Some(
+            "NVENC is not available (no NVIDIA GPU, missing driver, or AV1 NVENC \
+             needs RTX 4000+).  Switch to a different --encoder.",
+        );
+    }
+
+    // hevc_metadata BSF refusing to start because hevc_amf isn't
+    // emitting parameter sets in-band.  Should be fixed by
+    // `-header_insertion_mode idr` (we set this since v0.x.x), so if
+    // an operator still hits it on a custom build we want them to
+    // know which knob to look at.
+    if line.contains("hevc_metadata") && line.contains("VPS id 0 not available") {
+        return Some(
+            "hevc_amf is emitting an HEVC bitstream without VPS/SPS/PPS in-band — the \
+             hevc_metadata BSF can't proceed.  Make sure hevc_amf is invoked with \
+             `-header_insertion_mode idr` (the default ships this).",
+        );
+    }
+
+    None
 }
 
 // ── Encoded byte-stream reader ─────────────────────────────────────
@@ -1458,6 +1533,38 @@ mod tests {
         assert_eq!(CodecKind::H264.protocol_id(), 0);
         assert_eq!(CodecKind::Hevc.protocol_id(), 1);
         assert_eq!(CodecKind::Av1.protocol_id(), 2);
+    }
+
+    #[test]
+    fn ffmpeg_stderr_hint_detects_av1_amf_unsupported() {
+        // The exact line emitted by FFmpeg when the GPU/driver lacks
+        // an AV1 hardware encoder, captured from a real run on a
+        // pre-RDNA3 AMD card.
+        let line = "[av1_amf @ 000002b2687ee4c0] CreateComponent(AMFVideoEncoderHW_AV1) \
+                    failed with error 30";
+        let hint = ffmpeg_stderr_hint(line).expect("must produce a hint");
+        assert!(hint.contains("RDNA3"), "hint should mention HW requirement");
+        assert!(hint.contains("--encoder"), "hint should suggest a switch");
+    }
+
+    #[test]
+    fn ffmpeg_stderr_hint_detects_hevc_metadata_missing_vps() {
+        let line = "[hevc_metadata @ 000001cb4bc0c040] VPS id 0 not available.";
+        assert!(ffmpeg_stderr_hint(line).is_some());
+    }
+
+    #[test]
+    fn ffmpeg_stderr_hint_ignores_normal_progress_lines() {
+        for line in [
+            "frame=  120 fps= 60 q=20.0 size=     128KiB time=00:00:02.00",
+            "Stream #0:0: Video: hevc_amf, 2560x1440, 60 fps",
+            "",
+        ] {
+            assert!(
+                ffmpeg_stderr_hint(line).is_none(),
+                "must not flag noise: {line:?}",
+            );
+        }
     }
 
     #[test]
