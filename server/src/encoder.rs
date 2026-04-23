@@ -493,7 +493,31 @@ impl FfmpegEncoder {
                 "pipe:1",
             ]),
             CodecKind::Hevc => cmd.args([
-                "-bsf:v", "hevc_metadata=aud=insert",
+                // Two-stage bitstream filter chain:
+                //
+                //   1. `dump_extra=freq=keyframe` prepends the encoder's
+                //      `extradata` (which always contains VPS+SPS+PPS
+                //      for HEVC) to every keyframe packet.  Required
+                //      because `hevc_amf` on many AMF runtimes leaves
+                //      VPS *only* in extradata even with
+                //      `-header_insertion_mode idr` — `header_insertion_mode`
+                //      controls SPS/PPS placement but the AMF SDK
+                //      historically does not echo VPS into the
+                //      bitstream.  Without VPS in-band the next BSF in
+                //      the chain (`hevc_metadata`) refuses to start
+                //      with "VPS id 0 not available / Failed to read
+                //      unit 0 (type 33)".
+                //   2. `hevc_metadata=aud=insert` then walks the
+                //      now-complete parameter-set-prefixed bitstream
+                //      and inserts AUDs (NAL type 35) between access
+                //      units.  Our HevcSplitter on the read side keys
+                //      off these AUDs.
+                //
+                // Side benefit: VPS+SPS+PPS in front of every IDR also
+                // lets WebCodecs clients joining mid-stream resync at
+                // the next 1 s IDR boundary instead of waiting for a
+                // separate `extradata` blob.
+                "-bsf:v", "dump_extra=freq=keyframe,hevc_metadata=aud=insert",
                 "-f", "hevc",
                 "pipe:1",
             ]),
@@ -698,15 +722,15 @@ pub(crate) fn ffmpeg_stderr_hint(line: &str) -> Option<&'static str> {
     }
 
     // hevc_metadata BSF refusing to start because hevc_amf isn't
-    // emitting parameter sets in-band.  Should be fixed by
-    // `-header_insertion_mode idr` (we set this since v0.x.x), so if
-    // an operator still hits it on a custom build we want them to
+    // emitting parameter sets in-band.  Should be fixed by prepending
+    // `dump_extra=freq=keyframe` to the BSF chain (we ship this), so
+    // if an operator still hits it on a custom build we want them to
     // know which knob to look at.
     if line.contains("hevc_metadata") && line.contains("VPS id 0 not available") {
         return Some(
-            "hevc_amf is emitting an HEVC bitstream without VPS/SPS/PPS in-band — the \
-             hevc_metadata BSF can't proceed.  Make sure hevc_amf is invoked with \
-             `-header_insertion_mode idr` (the default ships this).",
+            "hevc_amf is emitting an HEVC bitstream without VPS in-band and the \
+             encoder's extradata isn't being prepended.  Make sure the BSF chain \
+             starts with `dump_extra=freq=keyframe` (the default ships this).",
         );
     }
 
