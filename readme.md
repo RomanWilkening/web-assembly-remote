@@ -48,7 +48,7 @@ browser's WebCodecs API (also hardware-accelerated) and renders on a `<canvas>`.
 |-------|-----------|
 | Codec | H.264 (universal), HEVC (better compression at the same QP), AV1 (best compression but newer HW only) |
 | Chroma | 4:2:0 (default, universal HW decode) or 4:4:4 (`--chroma 444`, sharper text/UI; HW-decoder support varies) |
-| Colour | BT.709 + full PC range tags emitted to FFmpeg so the browser composes colours identical to the source desktop |
+| Colour | BT.709 + full PC range tags emitted to FFmpeg for software encoders (`libx264` / `libx265` / `libsvtav1`). HW encoders (AMF / NVENC / QSV / VAAPI) write their own SPS VUI fields and the global `-color_*` flags are deliberately omitted to avoid an AMF-specific reconfigure stall observed on Windows 11 with AMD drivers. |
 
 ## Prerequisites
 
@@ -104,8 +104,8 @@ CLI flags:
 | `--quality` | `20` | Codec QP/CRF value (lower = better quality, higher bitrate). Ignored when `--bitrate-kbps` is set. |
 | `--encoder` | `h264_amf` | FFmpeg encoder name (`h264_amf` / `hevc_amf` / `av1_amf` for AMD, `h264_nvenc` / `hevc_nvenc` / `av1_nvenc` for NVIDIA, `libx264` / `libx265` / `libsvtav1` for CPU fallback). |
 | `--codec` | auto | Override codec family for splitting + browser decoder (`h264`, `hevc`, `av1`). Auto-detected from `--encoder` when omitted. |
-| `--chroma` | `420` | Chroma sub-sampling: `420` (universal HW decode) or `444` (sharper text, less HW support). |
-| `--slices` | `1` | Number of slices per encoded frame. Higher values reduce decode latency at the cost of slightly worse compression. Honoured by H.264/HEVC encoders; ignored by AV1. |
+| `--chroma` | `420` | Chroma sub-sampling: `420` (universal HW decode, no explicit pixel-format conversion — FFmpeg auto-negotiates the BGRA → encoder-native path) or `444` (sharper text via `-pix_fmt yuv444p`, less HW decoder support). |
+| `--slices` | `1` | Number of slices per encoded frame. Higher values reduce decode latency at the cost of slightly worse compression. Honoured by H.264/HEVC encoders; ignored by AV1. The flag is only forwarded to FFmpeg when N > 1, so the default keeps the historical command line that older `h264_amf` builds were tuned against. |
 | `--bitrate-kbps` | _unset_ | Switch from constant-quality (CQP/CRF) to CBR with a 1-frame VBV buffer. Useful on bandwidth-limited links where stable glass-to-glass latency matters more than constant visual quality. |
 | `--static-dir` | `./static` | Path to client web files |
 | `--config` | `config.toml` | Path to TOML configuration file |

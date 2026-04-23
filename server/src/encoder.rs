@@ -159,30 +159,61 @@ impl FfmpegEncoder {
         // The desktop is sRGB / full-range; without explicit tags the
         // browser decoder assumes BT.601 limited range and renders
         // colours slightly desaturated.  BT.709 + PC range matches what
-        // Sunshine and Moonlight emit and produces visually identical
-        // colours to the server-side desktop.
-        cmd.args([
-            "-color_range", "pc",
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709",
-        ]);
+        // Sunshine and Moonlight emit.
+        //
+        // We only emit these flags for software encoders.  AMD AMF and
+        // NVENC builds historically reject or mishandle the global
+        // `-color_*` arguments — on some FFmpeg/AMF combinations they
+        // trigger an internal reconfigure after the first frame and the
+        // pipeline stalls — so we let those encoders write their own
+        // SPS VUI fields (which both vendors already do correctly for
+        // 8-bit RGB capture) instead.
+        let is_hw_encoder = matches!(
+            cfg.encoder_name.as_str(),
+            "h264_amf" | "hevc_amf" | "av1_amf"
+                | "h264_nvenc" | "hevc_nvenc" | "av1_nvenc"
+                | "h264_qsv" | "hevc_qsv" | "av1_qsv"
+                | "h264_vaapi" | "hevc_vaapi" | "av1_vaapi"
+        );
+        if !is_hw_encoder {
+            cmd.args([
+                "-color_range", "pc",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+            ]);
+        }
 
-        // ── pixel-format conversion (chroma sub-sampling) ─────
-        // The encoder needs an explicit YUV pixel format; a `-vf` filter
-        // converts BGRA → YUV at the requested chroma sub-sampling.
-        // 4:2:0 is the universal HW-decoder baseline; 4:4:4 preserves
-        // chroma resolution (sharper text) but requires a HW decoder
-        // that supports the corresponding profile.
+        // ── pixel-format hint (chroma sub-sampling) ────────────
+        // For the default 4:2:0 case we let FFmpeg auto-negotiate the
+        // BGRA → encoder-native conversion (this matches the pre-PR
+        // behaviour that the stable-release encoders such as `h264_amf`
+        // were tuned against — those want NV12, and forcing an
+        // intermediate `-vf format=yuv420p` filter chain combined with
+        // `-flags low_delay` could deadlock the encoder after the first
+        // emitted packet on some Windows AMF builds).
+        //
+        // For 4:4:4 we *do* need to force the format because the
+        // automatic negotiation defaults to 4:2:0 even when the encoder
+        // can ingest 4:4:4 data.
         let pix_fmt = match cfg.chroma {
-            Chroma::Yuv420 => "yuv420p",
-            Chroma::Yuv444 => "yuv444p",
+            Chroma::Yuv420 => None,
+            Chroma::Yuv444 => Some("yuv444p"),
         };
-        cmd.args(["-vf", &format!("format={}", pix_fmt)]);
+        if let Some(pf) = pix_fmt {
+            cmd.args(["-pix_fmt", pf]);
+        }
 
         // ── encoder-specific flags ─────────────────────────────
         let q = cfg.quality.to_string();
-        let slices = cfg.slices.max(1).to_string();
+        let slices_n = cfg.slices.max(1);
+        let slices = slices_n.to_string();
+        // `-slices` is only added when the user opts in (>1).  Some
+        // encoder builds (notably older `h264_amf` releases) do not
+        // expose the codec-generic `slices` AVOption and will reject
+        // the flag — keeping the default at "no flag" preserves the
+        // historical, known-working command line for HW encoders.
+        let want_slices = slices_n > 1;
         let bitrate_arg = cfg.bitrate_kbps.map(|kb| format!("{}k", kb));
         let vbv_buf_arg = cfg
             .bitrate_kbps
@@ -218,8 +249,10 @@ impl FfmpegEncoder {
                 cmd.args([
                     "-profile:v",
                     if cfg.chroma == Chroma::Yuv444 { "high" } else { "main" },
-                    "-slices", &slices,
                 ]);
+                if want_slices {
+                    cmd.args(["-slices", &slices]);
+                }
             }
             "hevc_amf" => {
                 cmd.args([
@@ -231,8 +264,10 @@ impl FfmpegEncoder {
                 cmd.args([
                     "-profile:v",
                     if cfg.chroma == Chroma::Yuv444 { "rext" } else { "main" },
-                    "-slices", &slices,
                 ]);
+                if want_slices {
+                    cmd.args(["-slices", &slices]);
+                }
             }
             "av1_amf" => {
                 cmd.args([
@@ -261,7 +296,9 @@ impl FfmpegEncoder {
                 } else {
                     cmd.args(["-rc", "constqp", "-qp", &q]);
                 }
-                cmd.args(["-slices", &slices]);
+                if want_slices {
+                    cmd.args(["-slices", &slices]);
+                }
             }
             "hevc_nvenc" => {
                 cmd.args([
@@ -280,7 +317,9 @@ impl FfmpegEncoder {
                 } else {
                     cmd.args(["-rc", "constqp", "-qp", &q]);
                 }
-                cmd.args(["-slices", &slices]);
+                if want_slices {
+                    cmd.args(["-slices", &slices]);
+                }
             }
             "av1_nvenc" => {
                 cmd.args([
@@ -318,8 +357,10 @@ impl FfmpegEncoder {
                 cmd.args([
                     "-profile:v",
                     if cfg.chroma == Chroma::Yuv444 { "high444" } else { "baseline" },
-                    "-slices", &slices,
                 ]);
+                if want_slices {
+                    cmd.args(["-slices", &slices]);
+                }
             }
             "libx265" => {
                 cmd.args([
@@ -336,11 +377,13 @@ impl FfmpegEncoder {
                 } else {
                     cmd.args(["-crf", &q]);
                 }
-                // x265 expects slice count via `-x265-params slices=N`.
-                cmd.args([
-                    "-x265-params",
-                    &format!("slices={}", slices),
-                ]);
+                if want_slices {
+                    // x265 expects slice count via `-x265-params slices=N`.
+                    cmd.args([
+                        "-x265-params",
+                        &format!("slices={}", slices),
+                    ]);
+                }
             }
             "libsvtav1" => {
                 cmd.args([
