@@ -57,6 +57,37 @@ export class VideoStreamDecoder {
     this._latencyMs = null;
     /** @private @type {number} – CODEC_* constant */
     this._codecId = CODEC_H264;
+
+    // ── Diagnostic counters ─────────────────────────────────────
+    // Match the server-side `encoder-reader` / `ws-sender` counters so
+    // an operator can correlate frame flow end-to-end.  Each number is
+    // monotonic over the lifetime of this decoder instance; the
+    // periodic ticker in `main.js` reads them via `stats()`.
+    /** @private */ this._decodeIn        = 0; // chunks submitted to VideoDecoder
+    /** @private */ this._decodeOut       = 0; // VideoFrames produced (output cb)
+    /** @private */ this._droppedQueueFull = 0; // delta frames skipped due to deep queue
+    /** @private */ this._droppedNoConfig  = 0; // delta frames dropped while waiting for IDR
+    /** @private */ this._errors           = 0; // VideoDecoder errors observed
+    /** @private @type {string|null} */ this._lastError = null;
+  }
+
+  /**
+   * Snapshot of the diagnostic counters; called by the periodic ticker
+   * in `main.js`.  Never throws.
+   * @returns {{in:number,out:number,dropped:number,droppedNoCfg:number,errors:number,lastError:(string|null),queueSize:number,configured:boolean,state:string}}
+   */
+  stats() {
+    return {
+      in: this._decodeIn,
+      out: this._decodeOut,
+      dropped: this._droppedQueueFull,
+      droppedNoCfg: this._droppedNoConfig,
+      errors: this._errors,
+      lastError: this._lastError,
+      queueSize: this._decoder ? this._decoder.decodeQueueSize : 0,
+      configured: this._configured,
+      state: this._decoder ? this._decoder.state : 'none',
+    };
   }
 
   /**
@@ -136,8 +167,25 @@ export class VideoStreamDecoder {
     }
 
     this._decoder = new VideoDecoder({
-      output: (frame) => this._onFrame(frame),
+      output: (frame) => {
+        this._decodeOut++;
+        // Diagnostic: log the first two decoded frames so an operator
+        // can correlate "encoder-reader: emitted frame #N" / "ws-sender:
+        // shipped frame #N" / "MSG_VIDEO_FRAME #N received" with
+        // "VideoDecoder produced frame #N".  A silent gap here means
+        // WebCodecs accepted the chunks but produced no output (codec
+        // mismatch, hardware fallback, etc.).
+        if (this._decodeOut <= 2) {
+          console.log(
+            `VideoDecoder produced frame #${this._decodeOut}: ` +
+            `${frame.codedWidth}x${frame.codedHeight}, ts=${frame.timestamp}us`,
+          );
+        }
+        this._onFrame(frame);
+      },
       error: (e) => {
+        this._errors++;
+        this._lastError = (e && e.message) ? e.message : String(e);
         console.error('VideoDecoder error:', e);
         // Mark as unconfigured so the next key-frame triggers
         // re-initialisation instead of feeding a closed decoder.
@@ -189,7 +237,10 @@ export class VideoStreamDecoder {
     }
 
     if (!this._configured) {
-      if (!isKeyFrame) return; // need a key-frame first
+      if (!isKeyFrame) {
+        this._droppedNoConfig++;
+        return; // need a key-frame first
+      }
       this._configureFromKeyFrame(data);
       if (!this._configured) return;
     }
@@ -205,6 +256,7 @@ export class VideoStreamDecoder {
     // `setLatencyMs()`; falls back to a conservative magic number of 3
     // if no RTT samples have been recorded yet.
     if (!isKeyFrame && this._decoder.decodeQueueSize > this._dropThreshold()) {
+      this._droppedQueueFull++;
       return;
     }
 
@@ -216,7 +268,10 @@ export class VideoStreamDecoder {
 
     try {
       this._decoder.decode(chunk);
+      this._decodeIn++;
     } catch (e) {
+      this._errors++;
+      this._lastError = (e && e.message) ? e.message : String(e);
       console.error('decode() threw:', e);
       this._configured = false;
     }

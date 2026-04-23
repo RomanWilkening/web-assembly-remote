@@ -163,6 +163,46 @@ async function main() {
   let lastFrameTime = 0;
   let stallTimerId = 0;
 
+  // ── Client-side diagnostic ticker ───────────────────────────
+  // Mirrors the server's 5-second `ws-sender` / `encoder-reader`
+  // counters by logging the matching counters on the client every
+  // 5 s.  Lets an operator pinpoint exactly where in the pipeline
+  // (network → decoder → renderer) frames are being lost when the
+  // remote desktop appears frozen.  Started on `ws.open`, stopped on
+  // `ws.close`, and counters are reset by `connect()`.
+  const DIAG_TICK_MS = 5000;
+  let diagTickerId = 0;
+  function startDiagTicker() {
+    clearInterval(diagTickerId);
+    diagTickerId = setInterval(() => {
+      try {
+        console.log(`client-rx: video_frames=${videoFramesReceived}`);
+        const ds = decoder.stats();
+        console.log(
+          `decoder: in=${ds.in}, out=${ds.out}, ` +
+          `dropped_queue_full=${ds.dropped}, dropped_no_cfg=${ds.droppedNoCfg}, ` +
+          `queueSize=${ds.queueSize}, configured=${ds.configured}, ` +
+          `state=${ds.state}, errors=${ds.errors}` +
+          (ds.lastError ? `, lastError=${ds.lastError}` : ''),
+        );
+        const rs = renderer.stats();
+        console.log(
+          `renderer: submitted=${rs.submitted}, painted=${rs.painted}, ` +
+          `coalesced=${rs.coalesced}, errors=${rs.errors}, ` +
+          `backend=${rs.backend}, canvas=${rs.canvas}` +
+          (rs.lastError ? `, lastError=${rs.lastError}` : ''),
+        );
+      } catch (e) {
+        // Never let a diagnostic log kill the page.
+        console.warn('diag ticker error:', e);
+      }
+    }, DIAG_TICK_MS);
+  }
+  function stopDiagTicker() {
+    clearInterval(diagTickerId);
+    diagTickerId = 0;
+  }
+
   /** Send binary data over the WebSocket (if connected). */
   const send = (data) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -406,6 +446,7 @@ async function main() {
   function stopStream() {
     streaming = false;
     clearTimeout(stallTimerId);
+    stopDiagTicker();
     if (ws) {
       ws.close();
       ws = null;
@@ -552,10 +593,14 @@ async function main() {
       // Start the stall detector – if no video frame arrives within the
       // timeout the connection will be recycled automatically.
       resetStallTimer();
+      // Start the periodic client-side diagnostic ticker so the next
+      // captured log shows exactly where in the pipeline frames stop.
+      startDiagTicker();
     });
 
     ws.addEventListener('close', () => {
       clearTimeout(stallTimerId);
+      stopDiagTicker();
       if (streaming) {
         statusEl.textContent = 'Disconnected';
         decoder.close();

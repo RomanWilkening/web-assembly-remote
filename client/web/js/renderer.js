@@ -45,12 +45,42 @@ export class Renderer {
     /** @private */
     this._lowLatency = opts.lowLatency !== false;
 
+    // ── Diagnostic counters ─────────────────────────────────────
+    // Symmetrical with the server's encoder-reader / ws-sender
+    // counters and the decoder's `stats()`.  `submitted` increments on
+    // every drawFrame() call (one per VideoDecoder output);
+    // `painted` increments only after a successful backend `draw()` —
+    // a gap between the two means frames are being coalesced (in
+    // rAF mode) or thrown away due to a draw error.
+    /** @private */ this._submitted    = 0;
+    /** @private */ this._painted      = 0;
+    /** @private */ this._coalesced    = 0;
+    /** @private */ this._drawErrors   = 0;
+    /** @private @type {string|null} */ this._lastDrawError = null;
+
     /** @private @type {WebGL2Backend|Canvas2DBackend} */
     this._backend = WebGL2Backend.tryCreate(canvas) || new Canvas2DBackend(canvas);
     console.log(
       `Renderer backend: ${this._backend.name}` +
       (this._lowLatency ? ' (low-latency, sync paint)' : ' (rAF-coalesced)'),
     );
+  }
+
+  /**
+   * Snapshot of the diagnostic counters for the periodic ticker in
+   * `main.js`.  Never throws.
+   * @returns {{submitted:number,painted:number,coalesced:number,errors:number,lastError:(string|null),backend:string,canvas:string}}
+   */
+  stats() {
+    return {
+      submitted: this._submitted,
+      painted: this._painted,
+      coalesced: this._coalesced,
+      errors: this._drawErrors,
+      lastError: this._lastDrawError,
+      backend: this._backend ? this._backend.name : 'none',
+      canvas: `${this._canvas.width}x${this._canvas.height}`,
+    };
   }
 
   /**
@@ -71,8 +101,10 @@ export class Renderer {
    * @param {VideoFrame} frame
    */
   drawFrame(frame) {
+    this._submitted++;
     // Drop the old pending frame to keep latency at minimum.
     if (this._pendingFrame) {
+      this._coalesced++;
       this._pendingFrame.close();
     }
     this._pendingFrame = frame;
@@ -108,7 +140,22 @@ export class Renderer {
       this._pendingFrame = null;
       try {
         this._backend.draw(frame);
+        this._painted++;
+        // Diagnostic: log the first two paints with the backend and
+        // canvas dimensions.  A silent gap between "VideoDecoder
+        // produced frame #N" and "Renderer painted frame #N" means the
+        // backend `draw()` is throwing or the canvas is hidden / 0×0.
+        if (this._painted <= 2) {
+          console.log(
+            `Renderer painted frame #${this._painted}: ` +
+            `backend=${this._backend.name}, ` +
+            `canvas=${this._canvas.width}x${this._canvas.height}, ` +
+            `frame=${frame.codedWidth}x${frame.codedHeight}`,
+          );
+        }
       } catch (e) {
+        this._drawErrors++;
+        this._lastDrawError = (e && e.message) ? e.message : String(e);
         console.warn('draw failed:', e);
         // If the WebGL2 backend dies for some reason (e.g. context lost
         // or a driver bug rejecting texImage2D from a VideoFrame on this
