@@ -561,6 +561,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 sent_frames,
                                 payload_len
                             );
+                        } else {
+                            // Mirror the encoder-reader's per-keyframe log
+                            // (see `encoder_reader_loop`) so an operator can
+                            // correlate "encoder-reader: emitted KEY frame
+                            // #N" with the same frame leaving the WebSocket.
+                            log::info!(
+                                "ws-sender: shipped KEY frame #{} (#{} key, {} bytes incl. header)",
+                                sent_frames,
+                                sent_keys,
+                                payload_len
+                            );
                         }
                     }
 
