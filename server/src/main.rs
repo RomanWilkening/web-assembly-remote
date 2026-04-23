@@ -26,13 +26,41 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     fps: u32,
 
-    /// Encoder quality (QP value, lower = better quality, 15-30 recommended)
+    /// Encoder quality (QP/CRF value, lower = better quality, 15-30 recommended).
+    /// Ignored when `--bitrate-kbps` switches the encoder to CBR.
     #[arg(long, default_value_t = 20)]
     quality: u8,
 
-    /// Video encoder to use (h264_amf for AMD GPU, libx264 for CPU fallback)
+    /// Video encoder to use.  Examples:
+    /// `h264_amf` / `hevc_amf` / `av1_amf` (AMD GPU),
+    /// `h264_nvenc` / `hevc_nvenc` / `av1_nvenc` (NVIDIA GPU),
+    /// `libx264` / `libx265` / `libsvtav1` (CPU fallback).
     #[arg(long, default_value = "h264_amf")]
     encoder: String,
+
+    /// Override the codec family used for access-unit splitting and the
+    /// browser's `VideoDecoder` configuration.  Auto-detected from
+    /// `--encoder` when omitted.  Accepted values: `h264`, `hevc`, `av1`.
+    #[arg(long)]
+    codec: Option<String>,
+
+    /// Chroma sub-sampling (`420` for compatibility, `444` for sharper text).
+    #[arg(long, default_value = "420")]
+    chroma: String,
+
+    /// Number of slices per encoded frame (>= 1).  Slicing reduces the
+    /// "wait for the whole frame to arrive" decode latency at the cost
+    /// of slightly worse compression efficiency.  Honoured by H.264 /
+    /// HEVC encoders; ignored by AV1.
+    #[arg(long, default_value_t = 1)]
+    slices: u32,
+
+    /// Switch from constant-quality (CQP/CRF) to CBR with a 1-frame
+    /// VBV buffer.  Useful on bandwidth-limited links where stable
+    /// glass-to-glass latency matters more than constant visual
+    /// quality.  In kilobits per second.  Disabled when omitted.
+    #[arg(long)]
+    bitrate_kbps: Option<u32>,
 
     /// Path to static web files (client build output)
     #[arg(long, default_value = "./static")]
@@ -62,8 +90,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
 
+    // ── Resolve codec & chroma overrides ───────────────────────
+    let codec = match args.codec.as_deref() {
+        None => encoder::CodecKind::from_encoder_name(&args.encoder),
+        Some("h264") => encoder::CodecKind::H264,
+        Some("hevc") | Some("h265") => encoder::CodecKind::Hevc,
+        Some("av1") => encoder::CodecKind::Av1,
+        Some(other) => {
+            return Err(format!(
+                "Unknown --codec '{other}' (expected: h264, hevc, av1)"
+            )
+            .into());
+        }
+    };
+
+    let chroma = match args.chroma.as_str() {
+        "420" | "yuv420" | "yuv420p" => encoder::Chroma::Yuv420,
+        "444" | "yuv444" | "yuv444p" => encoder::Chroma::Yuv444,
+        other => {
+            return Err(format!(
+                "Unknown --chroma '{other}' (expected: 420 or 444)"
+            )
+            .into());
+        }
+    };
+
+    if args.slices == 0 {
+        return Err("--slices must be >= 1".into());
+    }
+
     log::info!("Starting remote desktop server on {}", addr);
-    log::info!("Encoder: {}, FPS: {}, Quality (QP): {}", args.encoder, args.fps, args.quality);
+    log::info!(
+        "Encoder: {} (codec={:?}), FPS: {}, Quality: {}, Chroma: {:?}, Slices: {}, Bitrate: {}",
+        args.encoder,
+        codec,
+        args.fps,
+        args.quality,
+        chroma,
+        args.slices,
+        args.bitrate_kbps
+            .map(|b| format!("{b} kbps (CBR)"))
+            .unwrap_or_else(|| "CQP/CRF".into()),
+    );
     log::info!("Static files: {}", args.static_dir);
 
     // Determine audio device: CLI flag takes precedence over config file.
@@ -83,6 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fps: args.fps,
         quality: args.quality,
         encoder: args.encoder,
+        codec,
+        chroma,
+        slices: args.slices,
+        bitrate_kbps: args.bitrate_kbps,
         static_dir: args.static_dir,
         auth: app_config.auth,
         audio_device,

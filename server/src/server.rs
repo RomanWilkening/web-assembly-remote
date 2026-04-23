@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{net::SocketAddr, time::Instant};
+use std::{collections::VecDeque, net::SocketAddr, time::Instant};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tower_http::services::ServeDir;
@@ -18,7 +18,7 @@ use crate::auth::{self, AuthState};
 use crate::capture::{self, ScreenCapture};
 use crate::config::AuthConfig;
 use crate::cursor;
-use crate::encoder::{EncodedFrame, FfmpegEncoder};
+use crate::encoder::{Chroma, CodecKind, EncodedFrame, EncoderConfig, FfmpegEncoder};
 use crate::input::InputSimulator;
 use crate::audio;
 
@@ -27,6 +27,10 @@ pub struct ServerConfig {
     pub fps: u32,
     pub quality: u8,
     pub encoder: String,
+    pub codec: CodecKind,
+    pub chroma: Chroma,
+    pub slices: u32,
+    pub bitrate_kbps: Option<u32>,
     pub static_dir: String,
     pub auth: AuthConfig,
     pub audio_device: Option<String>,
@@ -37,6 +41,10 @@ struct AppState {
     fps: u32,
     quality: u8,
     encoder: String,
+    codec: CodecKind,
+    chroma: Chroma,
+    slices: u32,
+    bitrate_kbps: Option<u32>,
     auth: AuthState,
     audio_device: Option<String>,
 }
@@ -54,6 +62,10 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         fps: cfg.fps,
         quality: cfg.quality,
         encoder: cfg.encoder,
+        codec: cfg.codec,
+        chroma: cfg.chroma,
+        slices: cfg.slices,
+        bitrate_kbps: cfg.bitrate_kbps,
         auth: auth_state.clone(),
         audio_device: cfg.audio_device,
     };
@@ -229,12 +241,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         width: screen_w,
         height: screen_h,
         fps: state.fps as u8,
+        codec: state.codec.protocol_id(),
     };
     log::info!(
-        "Sending ServerInfo: {}×{} @ {} fps (monitor {} at {}, {})",
+        "Sending ServerInfo: {}×{} @ {} fps, codec={:?} (id {}) (monitor {} at {}, {})",
         screen_w,
         screen_h,
         state.fps,
+        state.codec,
+        state.codec.protocol_id(),
         selected_monitor,
         mon_x,
         mon_y
@@ -248,8 +263,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    // Channel: encoder → WebSocket sender (small buffer to avoid latency).
-    let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(2);
+    // Channel: encoder → WebSocket sender.  Capacity 4 is large enough to
+    // absorb a brief WebSocket-write stall (e.g. a slow Wi-Fi burst) so
+    // the encoder thread doesn't block on `send()`, but small enough that
+    // the *send-side* coalescer (see below) can keep latency low by
+    // dropping intermediate delta frames whenever the link is the
+    // bottleneck.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(4);
 
     // Channel: WebSocket receiver → input handler.
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -269,6 +289,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let fps = state.fps;
     let quality = state.quality;
     let encoder_name = state.encoder.clone();
+    let codec = state.codec;
+    let chroma = state.chroma;
+    let slices = state.slices;
+    let bitrate_kbps = state.bitrate_kbps;
     let monitor_idx = selected_monitor;
 
     // ── 3. Spawn the capture + encode pipeline (blocking thread) ──
@@ -278,15 +302,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let cap_mon_h = screen_h as u32;
     let capture_handle = tokio::task::spawn_blocking(move || {
         if let Err(e) = capture_loop(
-            fps,
-            quality,
-            &encoder_name,
-            frame_tx,
-            monitor_idx,
-            cap_mon_x,
-            cap_mon_y,
-            cap_mon_w,
-            cap_mon_h,
+            CaptureLoopArgs {
+                fps,
+                quality,
+                encoder_name: &encoder_name,
+                codec,
+                chroma,
+                slices,
+                bitrate_kbps,
+                frame_tx,
+                monitor_index: monitor_idx,
+                monitor_x: cap_mon_x,
+                monitor_y: cap_mon_y,
+                monitor_w: cap_mon_w,
+                monitor_h: cap_mon_h,
+            },
         ) {
             log::error!("Capture loop error: {e}");
         }
@@ -415,6 +445,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // Consume the immediate first tick so the first ping fires after 5 s.
         ping_interval.tick().await;
 
+        // ── Diagnostic counters (paired with `encoder-reader` log) ──
+        // A summary every 5 s lets us correlate "frames produced by the
+        // encoder" with "frames actually shipped to the client", which
+        // in turn rules out (or in) starvation between the encoder
+        // reader thread and the WebSocket writer.
+        let mut sent_frames: u64 = 0;
+        let mut sent_keys: u64 = 0;
+        let mut dropped_deltas: u64 = 0;
+        let mut diag_interval = time::interval(Duration::from_secs(5));
+        diag_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        diag_interval.tick().await;
+
         loop {
             tokio::select! {
                 // `biased;` makes the select arms be polled in source
@@ -437,9 +479,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Some(audio_data) = audio_rx.recv() => {
-                    let msg = protocol::ServerMessage::AudioData { data: audio_data };
-                    let bin = msg.encode();
-                    if ws_tx.send(Message::Binary(bin)).await.is_err() {
+                    // `audio_data` is already wire-framed by the
+                    // capture loop: byte 0 is `MSG_AUDIO_DATA`, bytes
+                    // 1.. are the raw PCM payload.  Ship it directly,
+                    // skipping the redundant
+                    // `ServerMessage::AudioData::encode()` round-trip
+                    // that would otherwise allocate a fresh ~7.7 kB
+                    // `Vec<u8>` on every 20 ms tick.
+                    debug_assert!(
+                        audio_data.first().copied() == Some(protocol::MSG_AUDIO_DATA),
+                        "audio chunk must be pre-framed with MSG_AUDIO_DATA tag",
+                    );
+                    if ws_tx.send(Message::Binary(audio_data)).await.is_err() {
                         break;
                     }
                 }
@@ -448,18 +499,91 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     }
                 }
-                Some(mut frame) = frame_rx.recv() => {
-                    // Fill the 10 reserved header bytes of the AU buffer
-                    // in place; this avoids a second copy of the H.264
-                    // payload that the previous `ServerMessage::encode()`
-                    // path performed.
-                    debug_assert!(frame.data.len() >= EncodedFrame::HEADER_LEN);
-                    let ts = timestamp_us().to_le_bytes();
-                    frame.data[0] = protocol::MSG_VIDEO_FRAME;
-                    frame.data[1..9].copy_from_slice(&ts);
-                    frame.data[9] = u8::from(frame.is_keyframe);
-                    if ws_tx.send(Message::Binary(frame.data)).await.is_err() {
-                        break;
+                _ = diag_interval.tick() => {
+                    log::info!(
+                        "ws-sender: sent_frames={} (keys={}, dropped_intermediate_deltas={})",
+                        sent_frames,
+                        sent_keys,
+                        dropped_deltas
+                    );
+                }
+                Some(frame) = frame_rx.recv() => {
+                    // ── IDR-aware drop policy ──────────────────────────
+                    //
+                    // We must NEVER drop a P-frame in isolation: P-frames
+                    // reference previous frames, and a WebCodecs (or any
+                    // standards-compliant) decoder fed a P-frame whose
+                    // predecessor was dropped will silently produce no
+                    // output until the next IDR.  An earlier "newest-wins
+                    // delta coalescer" did exactly this and reduced the
+                    // perceived frame rate to ~1 fps (the IDR cadence).
+                    //
+                    // The only safe drop is a *whole sub-GOP*: if a
+                    // newer IDR is already queued behind us, every frame
+                    // currently in front of that IDR is about to be
+                    // invalidated by the IDR's full decoder reset, so
+                    // skipping straight to the IDR is lossless and
+                    // recovers latency.  We therefore peek ahead with
+                    // `try_recv` and, *only* when we find a newer IDR,
+                    // discard the queued head and ship the IDR first.
+                    //
+                    // Backpressure on a slow link is handled by the
+                    // WebSocket sink itself — `ws_tx.send().await`
+                    // suspends until the OS write buffer drains, which
+                    // naturally rate-limits the encoder via the bounded
+                    // `frame_rx` channel.
+                    let mut to_send: VecDeque<EncodedFrame> = VecDeque::new();
+                    to_send.push_back(frame);
+                    // Drain whatever is already queued so we can spot a
+                    // newer IDR without blocking.
+                    while let Ok(next) = frame_rx.try_recv() {
+                        if next.is_keyframe {
+                            // Everything queued so far is about to be
+                            // superseded by this IDR's decoder reset —
+                            // safe to drop it all.
+                            dropped_deltas += to_send.len() as u64;
+                            to_send.clear();
+                        }
+                        to_send.push_back(next);
+                    }
+
+                    while let Some(mut f) = to_send.pop_front() {
+                        debug_assert!(f.data.len() >= EncodedFrame::HEADER_LEN);
+                        let is_key = f.is_keyframe;
+                        let ts = timestamp_us().to_le_bytes();
+                        f.data[0] = protocol::MSG_VIDEO_FRAME;
+                        f.data[1..9].copy_from_slice(&ts);
+                        f.data[9] = u8::from(is_key);
+                        let payload_len = f.data.len();
+                        if ws_tx.send(Message::Binary(f.data)).await.is_err() {
+                            // Inner `while let` would only break the
+                            // drain loop, not the outer select loop —
+                            // exit the whole sender task instead.
+                            return;
+                        }
+                        sent_frames += 1;
+                        if is_key {
+                            sent_keys += 1;
+                        }
+                        if sent_frames <= 2 {
+                            log::info!(
+                                "ws-sender: shipped frame #{} ({}, {} bytes incl. header)",
+                                sent_frames,
+                                if is_key { "key" } else { "delta" },
+                                payload_len
+                            );
+                        } else if is_key {
+                            // Mirror the encoder-reader's per-keyframe log
+                            // (see `encoder_reader_loop`) so an operator can
+                            // correlate "encoder-reader: emitted KEY frame
+                            // #N" with the same frame leaving the WebSocket.
+                            log::info!(
+                                "ws-sender: shipped KEY frame #{} (#{} key, {} bytes incl. header)",
+                                sent_frames,
+                                sent_keys,
+                                payload_len
+                            );
+                        }
                     }
                 }
                 else => break,
@@ -509,23 +633,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let _ = input_handle.await;
 }
 
-/// Main capture → encode loop. Runs on a dedicated OS thread.
-///
-/// Cursor polling has been split off into its own task (see
-/// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
-/// to the encoder FPS.
-fn capture_loop(
+/// Bundled arguments for [`capture_loop`].  Avoids growing the
+/// function signature past sanity as we add encoder options.
+struct CaptureLoopArgs<'a> {
     fps: u32,
     quality: u8,
-    encoder_name: &str,
+    encoder_name: &'a str,
+    codec: CodecKind,
+    chroma: Chroma,
+    slices: u32,
+    bitrate_kbps: Option<u32>,
     frame_tx: mpsc::Sender<EncodedFrame>,
     monitor_index: usize,
     monitor_x: i32,
     monitor_y: i32,
     monitor_w: u32,
     monitor_h: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut capture = ScreenCapture::new_for_display(monitor_index)
+}
+
+/// Main capture → encode loop. Runs on a dedicated OS thread.
+///
+/// Cursor polling has been split off into its own task (see
+/// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
+/// to the encoder FPS.
+fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut capture = ScreenCapture::new_for_display(args.monitor_index)
         .or_else(|_| ScreenCapture::new())?;
     let w = capture.width();
     let h = capture.height();
@@ -534,19 +666,30 @@ fn capture_loop(
         "Capture initialized: {}×{} @ {} fps (monitor {} at {}, {})",
         w,
         h,
-        fps,
-        monitor_index,
-        monitor_x,
-        monitor_y
+        args.fps,
+        args.monitor_index,
+        args.monitor_x,
+        args.monitor_y
     );
     // monitor_w/h are passed in for symmetry with the cursor task; they
     // are not used directly here because the captured display already
     // reports its own dimensions.
-    let _ = (monitor_w, monitor_h);
+    let _ = (args.monitor_w, args.monitor_h);
 
-    let mut encoder = FfmpegEncoder::new(w, h, fps, quality, encoder_name, frame_tx)?;
+    let cfg = EncoderConfig {
+        width: w,
+        height: h,
+        fps: args.fps,
+        quality: args.quality,
+        encoder_name: args.encoder_name.to_string(),
+        codec: args.codec,
+        chroma: args.chroma,
+        slices: args.slices,
+        bitrate_kbps: args.bitrate_kbps,
+    };
+    let mut encoder = FfmpegEncoder::new(cfg, args.frame_tx)?;
 
-    let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
+    let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(args.fps));
     let boot = Instant::now();
     let mut frame_no: u64 = 0;
 

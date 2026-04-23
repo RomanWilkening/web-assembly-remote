@@ -7,7 +7,7 @@
  * 4. Controls: fullscreen, pointer lock, monitor select, start/stop, logout.
  */
 
-import { H264Decoder } from './decoder.js';
+import { VideoStreamDecoder } from './decoder.js';
 import { Renderer }     from './renderer.js';
 import { InputHandler }  from './input.js';
 import { AudioPlayer }   from './audio.js';
@@ -130,6 +130,12 @@ async function main() {
   /** Currently selected remote keyboard-layout KLID (default: de-DE). */
   const LAYOUT_STORAGE_KEY = 'remote_keyboard_layout';
   let currentLayoutKlid = 0x00000407;
+  /** Diagnostic counter: total MSG_VIDEO_FRAME messages received on the
+   *  current WebSocket connection.  Used to log the first two frames so
+   *  operators can correlate "frames arriving on the socket" with the
+   *  server's `ws-sender: shipped frame #N` lines.  Reset on each
+   *  reconnect by `connect()`. */
+  let videoFramesReceived = 0;
   try {
     const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
     if (stored) {
@@ -156,6 +162,46 @@ async function main() {
   const STALL_TIMEOUT_MS = 5000;
   let lastFrameTime = 0;
   let stallTimerId = 0;
+
+  // ── Client-side diagnostic ticker ───────────────────────────
+  // Mirrors the server's 5-second `ws-sender` / `encoder-reader`
+  // counters by logging the matching counters on the client every
+  // 5 s.  Lets an operator pinpoint exactly where in the pipeline
+  // (network → decoder → renderer) frames are being lost when the
+  // remote desktop appears frozen.  Started on `ws.open`, stopped on
+  // `ws.close`, and counters are reset by `connect()`.
+  const DIAG_TICK_MS = 5000;
+  let diagTickerId = 0;
+  function startDiagTicker() {
+    clearInterval(diagTickerId);
+    diagTickerId = setInterval(() => {
+      try {
+        console.log(`client-rx: video_frames=${videoFramesReceived}`);
+        const ds = decoder.stats();
+        console.log(
+          `decoder: in=${ds.in}, out=${ds.out}, ` +
+          `dropped_queue_full=${ds.dropped}, dropped_no_cfg=${ds.droppedNoCfg}, ` +
+          `queueSize=${ds.queueSize}, configured=${ds.configured}, ` +
+          `state=${ds.state}, errors=${ds.errors}` +
+          (ds.lastError ? `, lastError=${ds.lastError}` : ''),
+        );
+        const rs = renderer.stats();
+        console.log(
+          `renderer: submitted=${rs.submitted}, painted=${rs.painted}, ` +
+          `coalesced=${rs.coalesced}, errors=${rs.errors}, ` +
+          `backend=${rs.backend}, canvas=${rs.canvas}` +
+          (rs.lastError ? `, lastError=${rs.lastError}` : ''),
+        );
+      } catch (e) {
+        // Never let a diagnostic log kill the page.
+        console.warn('diag ticker error:', e);
+      }
+    }, DIAG_TICK_MS);
+  }
+  function stopDiagTicker() {
+    clearInterval(diagTickerId);
+    diagTickerId = 0;
+  }
 
   /** Send binary data over the WebSocket (if connected). */
   const send = (data) => {
@@ -235,7 +281,7 @@ async function main() {
 
   // ── 3. Set up decoder + renderer + audio ──────────────────────
   const renderer = new Renderer(canvas);
-  const decoder  = new H264Decoder((frame) => renderer.drawFrame(frame));
+  const decoder  = new VideoStreamDecoder((frame) => renderer.drawFrame(frame));
   const latencyTracker = new wasm.LatencyTracker(120);
   const audioPlayer = new AudioPlayer();
 
@@ -400,6 +446,7 @@ async function main() {
   function stopStream() {
     streaming = false;
     clearTimeout(stallTimerId);
+    stopDiagTicker();
     if (ws) {
       ws.close();
       ws = null;
@@ -533,6 +580,8 @@ async function main() {
 
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
+    // Reset diagnostic counter for the new connection.
+    videoFramesReceived = 0;
 
     ws.addEventListener('open', () => {
       statusEl.textContent = 'Connected – waiting for first frame…';
@@ -544,10 +593,14 @@ async function main() {
       // Start the stall detector – if no video frame arrives within the
       // timeout the connection will be recycled automatically.
       resetStallTimer();
+      // Start the periodic client-side diagnostic ticker so the next
+      // captured log shows exactly where in the pipeline frames stop.
+      startDiagTicker();
     });
 
     ws.addEventListener('close', () => {
       clearTimeout(stallTimerId);
+      stopDiagTicker();
       if (streaming) {
         statusEl.textContent = 'Disconnected';
         decoder.close();
@@ -630,7 +683,9 @@ async function main() {
         }
 
         case MSG_SERVER_INFO: {
-          // ServerInfo layout: [type u8][width u16 LE][height u16 LE][fps u8]
+          // ServerInfo layout (v2): [type u8][width u16 LE][height u16 LE][fps u8][codec u8]
+          // The codec byte was added in v2; older servers send only 6
+          // bytes and the missing field is interpreted as H.264 (= 0).
           if (data.length < 6) break;
           if (dvBuffer !== data.buffer) {
             dv = new DataView(data.buffer);
@@ -639,11 +694,13 @@ async function main() {
           const w   = dv.getUint16(data.byteOffset + 1, true);
           const h   = dv.getUint16(data.byteOffset + 3, true);
           const fps = data[5];
-          console.log(`ServerInfo: ${w}×${h} @ ${fps} fps`);
+          const codec = data.length >= 7 ? data[6] : 0;
+          console.log(`ServerInfo: ${w}×${h} @ ${fps} fps, codec=${codec}`);
           remoteW = w;
           remoteH = h;
           renderer.resize(w, h);
           decoder.setRemoteSize(w, h);
+          decoder.setCodec(codec);
 
           if (!inputHandler) {
             inputHandler = new InputHandler(canvas, wasm, send, w, h);
@@ -677,6 +734,19 @@ async function main() {
 
           // Reset the stall-detection timer on every received frame.
           resetStallTimer();
+
+          // Diagnostic: log the first two video frames received over the
+          // socket so an operator can verify on the client side that
+          // frames are flowing past the WebSocket layer.  Pair this with
+          // the server's `ws-sender: shipped frame #N` log line to tell
+          // network-side stalls apart from server-side encoder stalls.
+          videoFramesReceived++;
+          if (videoFramesReceived <= 2) {
+            console.log(
+              `MSG_VIDEO_FRAME #${videoFramesReceived} received: ` +
+              `payload=${h264Data.length}B, key=${isKey}`,
+            );
+          }
 
           // NOTE: Latency is measured separately via Ping/Pong (see the
           // periodic pinger above and the MSG_PONG handler below) so it
