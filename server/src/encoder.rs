@@ -765,13 +765,42 @@ pub trait FrameSplitter: Send {
 
 /// Splits an H.264 Annex-B byte-stream into access units by detecting
 /// AUD NAL units (nal_unit_type == 9).
+///
+/// Uses an index-based read cursor (`read_pos`) rather than draining the
+/// front of `buf` after every emitted access unit — `Vec::drain(..n)`
+/// memmoves the residual bytes (typically a partial next frame) to the
+/// vector's start, and at 60 fps with 100–500 KB IDRs that backlog of
+/// memcpy contends for the same memory bandwidth as the encoder-reader
+/// thread that is concurrently draining FFmpeg's stdout.  Compacting is
+/// instead performed lazily, only when the consumed prefix exceeds half
+/// of the buffer length, so the worst-case compaction work is bounded
+/// by the live (still-needed) bytes.
 pub struct H264Splitter {
     buf: Vec<u8>,
+    /// First index in `buf` that has not yet been emitted as part of an
+    /// access unit.  All bytes in `buf[..read_pos]` are dead.
+    read_pos: usize,
 }
 
 impl H264Splitter {
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(256 * 1024) }
+        Self { buf: Vec::with_capacity(256 * 1024), read_pos: 0 }
+    }
+
+    /// Compact `buf` if more than half of its content is dead bytes.
+    /// O(live_bytes) per compaction, amortised O(1) per emitted frame
+    /// (we only compact once we've consumed at least as many bytes as
+    /// remain).
+    fn compact(&mut self) {
+        if self.read_pos == 0 {
+            return;
+        }
+        let live = self.buf.len() - self.read_pos;
+        if self.read_pos > live {
+            self.buf.copy_within(self.read_pos.., 0);
+            self.buf.truncate(live);
+            self.read_pos = 0;
+        }
     }
 
     /// Find the byte offset of the next AUD start-code at or after `from`.
@@ -780,6 +809,8 @@ impl H264Splitter {
     /// on x86_64) and only then validates the surrounding start-code
     /// pattern.  This is dramatically faster on large I-frames than the
     /// previous byte-by-byte scan.
+    ///
+    /// `from` is interpreted in absolute buffer coordinates (post-`read_pos`).
     fn find_aud(&self, from: usize) -> Option<usize> {
         let d = &self.buf;
         let mut i = from;
@@ -836,14 +867,14 @@ impl H264Splitter {
 
 impl FrameSplitter for H264Splitter {
     fn buffered_bytes(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.read_pos
     }
 
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
 
-        let mut search = 0;
+        let mut search = self.read_pos;
         let mut prev_aud: Option<usize> = None;
 
         while search + 3 < self.buf.len() {
@@ -868,9 +899,8 @@ impl FrameSplitter for H264Splitter {
         }
 
         if let Some(start) = prev_aud {
-            if start > 0 {
-                self.buf.drain(..start);
-            }
+            self.read_pos = start;
+            self.compact();
         }
 
         frames
@@ -883,13 +913,30 @@ impl FrameSplitter for H264Splitter {
 /// AUD NAL units (nal_unit_type == 35).  Unlike H.264, HEVC uses a
 /// 2-byte NAL header where the type lives in bits 1–6 of the first
 /// byte (the leading bit is `forbidden_zero_bit`).
+///
+/// See [`H264Splitter`] for the rationale behind the index-based read
+/// cursor (`read_pos`) instead of `Vec::drain`.
 pub struct HevcSplitter {
     buf: Vec<u8>,
+    read_pos: usize,
 }
 
 impl HevcSplitter {
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(256 * 1024) }
+        Self { buf: Vec::with_capacity(256 * 1024), read_pos: 0 }
+    }
+
+    /// See [`H264Splitter::compact`].
+    fn compact(&mut self) {
+        if self.read_pos == 0 {
+            return;
+        }
+        let live = self.buf.len() - self.read_pos;
+        if self.read_pos > live {
+            self.buf.copy_within(self.read_pos.., 0);
+            self.buf.truncate(live);
+            self.read_pos = 0;
+        }
     }
 
     /// HEVC NAL header byte 0 → `nal_unit_type` (6 bits, after the
@@ -959,14 +1006,14 @@ impl HevcSplitter {
 
 impl FrameSplitter for HevcSplitter {
     fn buffered_bytes(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.read_pos
     }
 
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
 
-        let mut search = 0;
+        let mut search = self.read_pos;
         let mut prev_aud: Option<usize> = None;
 
         while search + 3 < self.buf.len() {
@@ -991,9 +1038,8 @@ impl FrameSplitter for HevcSplitter {
         }
 
         if let Some(start) = prev_aud {
-            if start > 0 {
-                self.buf.drain(..start);
-            }
+            self.read_pos = start;
+            self.compact();
         }
 
         frames
@@ -1028,11 +1074,26 @@ const OBU_FRAME: u8 = 6;
 /// ```
 pub struct Av1Splitter {
     buf: Vec<u8>,
+    /// See [`H264Splitter`] for the rationale.
+    read_pos: usize,
 }
 
 impl Av1Splitter {
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(256 * 1024) }
+        Self { buf: Vec::with_capacity(256 * 1024), read_pos: 0 }
+    }
+
+    /// See [`H264Splitter::compact`].
+    fn compact(&mut self) {
+        if self.read_pos == 0 {
+            return;
+        }
+        let live = self.buf.len() - self.read_pos;
+        if self.read_pos > live {
+            self.buf.copy_within(self.read_pos.., 0);
+            self.buf.truncate(live);
+            self.read_pos = 0;
+        }
     }
 
     /// Parse a LEB128 (variable-length unsigned integer, max 8 bytes
@@ -1065,8 +1126,8 @@ impl Av1Splitter {
         let mut keyframe_units: Vec<bool> = Vec::new();
         let mut current_is_key = false;
 
-        let mut pos = 0usize;
-        let mut last_complete_end = 0usize;
+        let mut pos = self.read_pos;
+        let mut last_complete_end = self.read_pos;
 
         while pos < self.buf.len() {
             let header = self.buf[pos];
@@ -1151,15 +1212,15 @@ impl Av1Splitter {
                     });
                 }
             }
-            // Drain everything before the last (still-open) TD.
-            let last_td = *td_starts.last().unwrap();
-            if last_td > 0 {
-                self.buf.drain(..last_td);
-            }
-        } else if last_complete_end > 0 && td_starts.is_empty() {
+            // Advance the read cursor to the last (still-open) TD; lazy
+            // compaction keeps the underlying buffer from growing.
+            self.read_pos = *td_starts.last().unwrap();
+            self.compact();
+        } else if last_complete_end > self.read_pos && td_starts.is_empty() {
             // Defensive: if we somehow consumed bytes without seeing a
-            // TD, drain the consumed region so we don't grow unbounded.
-            self.buf.drain(..last_complete_end);
+            // TD, advance the cursor so the buffer doesn't grow unbounded.
+            self.read_pos = last_complete_end;
+            self.compact();
         }
 
         frames
@@ -1168,7 +1229,7 @@ impl Av1Splitter {
 
 impl FrameSplitter for Av1Splitter {
     fn buffered_bytes(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.read_pos
     }
 
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
@@ -1234,6 +1295,44 @@ mod tests {
         let mut det = H264Splitter::new();
         let frames = det.push(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xff, 0xff]);
         assert!(frames.is_empty());
+    }
+
+    /// Drives the lazy-compaction path: feed many access units in
+    /// sequence and verify that the splitter's internal buffer doesn't
+    /// grow without bound.  Each push leaves only the trailing AUD
+    /// (5 bytes) plus partial next-frame payload as live data, so after
+    /// many iterations the live region must remain small.
+    #[test]
+    fn h264_lazy_compaction_keeps_buffer_bounded() {
+        let mut det = H264Splitter::new();
+        // Build a single AU large enough that the dead-prefix exceeds
+        // the live tail and triggers compaction every iteration.
+        let mut au = vec![0x00, 0x00, 0x00, 0x01, 0x09]; // AUD
+        au.extend_from_slice(&[0x00, 0x00, 0x01, 0x41]); // NAL type 1
+        au.extend(std::iter::repeat_n(0xaau8, 4096));    // big payload
+        let trailing_aud = [0x00, 0x00, 0x00, 0x01, 0x09];
+
+        // Prime with one open AU.
+        det.push(&au);
+
+        // Feed 100 more (closing AUDs) — each push completes the prior
+        // AU and starts a new one.  Without compaction the buffer would
+        // grow to ~400 KB.
+        for _ in 0..100 {
+            // Closing AUD for the previous AU + a fresh AU body.
+            let mut chunk = trailing_aud.to_vec();
+            chunk.extend_from_slice(&au[5..]); // body without leading AUD
+            let frames = det.push(&chunk);
+            assert_eq!(frames.len(), 1);
+        }
+
+        // After 100 iterations the live buffer must be O(one frame),
+        // not O(100 frames).  Allow generous headroom.
+        assert!(
+            det.buffered_bytes() < 16 * 1024,
+            "buffer grew unboundedly: {} bytes",
+            det.buffered_bytes()
+        );
     }
 
     /// Build a minimal HEVC AU: AUD (4-byte SC, type 35) + `payload`.
