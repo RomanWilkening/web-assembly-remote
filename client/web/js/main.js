@@ -130,6 +130,12 @@ async function main() {
   /** Currently selected remote keyboard-layout KLID (default: de-DE). */
   const LAYOUT_STORAGE_KEY = 'remote_keyboard_layout';
   let currentLayoutKlid = 0x00000407;
+  /** Diagnostic counter: total MSG_VIDEO_FRAME messages received on the
+   *  current WebSocket connection.  Used to log the first two frames so
+   *  operators can correlate "frames arriving on the socket" with the
+   *  server's `ws-sender: shipped frame #N` lines.  Reset on each
+   *  reconnect by `connect()`. */
+  let videoFramesReceived = 0;
   try {
     const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
     if (stored) {
@@ -533,6 +539,8 @@ async function main() {
 
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
+    // Reset diagnostic counter for the new connection.
+    videoFramesReceived = 0;
 
     ws.addEventListener('open', () => {
       statusEl.textContent = 'Connected – waiting for first frame…';
@@ -681,6 +689,19 @@ async function main() {
 
           // Reset the stall-detection timer on every received frame.
           resetStallTimer();
+
+          // Diagnostic: log the first two video frames received over the
+          // socket so an operator can verify on the client side that
+          // frames are flowing past the WebSocket layer.  Pair this with
+          // the server's `ws-sender: shipped frame #N` log line to tell
+          // network-side stalls apart from server-side encoder stalls.
+          videoFramesReceived++;
+          if (videoFramesReceived <= 2) {
+            console.log(
+              `MSG_VIDEO_FRAME #${videoFramesReceived} received: ` +
+              `payload=${h264Data.length}B, key=${isKey}`,
+            );
+          }
 
           // NOTE: Latency is measured separately via Ping/Pong (see the
           // periodic pinger above and the MSG_PONG handler below) so it

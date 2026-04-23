@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Video codec used by the encoder. Selects both the FFmpeg codec/format
@@ -619,22 +620,69 @@ fn encoder_reader_loop(
 ) {
     let mut buf = vec![0u8; 128 * 1024]; // 128 KiB read buffer
 
+    // ── Diagnostic counters ──────────────────────────────────────────
+    // Help diagnose pipeline stalls (e.g. "first frame visible, then
+    // nothing"): we emit a one-line summary every 5 seconds so the
+    // operator can tell at a glance whether
+    //   * FFmpeg is producing bytes (`bytes_read`),
+    //   * the splitter is recognising access-unit boundaries
+    //     (`frames_out`), and
+    //   * the channel-send is succeeding.
+    // The first two emissions are also logged unconditionally so a
+    // working pipeline shows up in the log without waiting 5 s.
+    let mut bytes_read: u64 = 0;
+    let mut frames_out: u64 = 0;
+    let mut last_report = Instant::now();
+    let report_every = Duration::from_secs(5);
+
     loop {
         match stdout.read(&mut buf) {
             Ok(0) => {
-                log::info!("FFmpeg stdout closed");
+                log::info!(
+                    "FFmpeg stdout closed (bytes_read={}, frames_out={})",
+                    bytes_read,
+                    frames_out
+                );
                 break;
             }
             Ok(n) => {
+                bytes_read += n as u64;
                 for frame in splitter.push(&buf[..n]) {
+                    let was = frames_out;
+                    frames_out += 1;
+                    if was < 2 {
+                        log::info!(
+                            "encoder-reader: emitted frame #{} ({} bytes payload, key={})",
+                            frames_out,
+                            frame.data.len() - EncodedFrame::HEADER_LEN,
+                            frame.is_keyframe
+                        );
+                    }
                     if tx.blocking_send(frame).is_err() {
-                        log::info!("Frame channel closed – stopping reader");
+                        log::info!(
+                            "Frame channel closed – stopping reader (bytes_read={}, frames_out={})",
+                            bytes_read,
+                            frames_out
+                        );
                         return;
                     }
                 }
+                if last_report.elapsed() >= report_every {
+                    log::info!(
+                        "encoder-reader: bytes_read={}, frames_out={}, splitter_buf={}",
+                        bytes_read,
+                        frames_out,
+                        splitter.buffered_bytes(),
+                    );
+                    last_report = Instant::now();
+                }
             }
             Err(e) => {
-                log::error!("FFmpeg read error: {e}");
+                log::error!(
+                    "FFmpeg read error: {e} (bytes_read={}, frames_out={})",
+                    bytes_read,
+                    frames_out
+                );
                 break;
             }
         }
@@ -653,6 +701,16 @@ pub trait FrameSplitter: Send {
     /// frame's `data` so the WebSocket sender can fill in the wire
     /// header in place.
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame>;
+
+    /// Number of bytes currently held in the splitter's internal buffer
+    /// (i.e. bytes received from the encoder that have not yet been
+    /// emitted as a complete access unit).  Used purely for diagnostic
+    /// logging — a steadily-growing value while `frames_out` stays
+    /// constant indicates that access-unit boundaries are no longer
+    /// being recognised in the encoder's output (e.g. AUD NAL units
+    /// missing from H.264 / HEVC streams, or temporal-delimiter OBUs
+    /// missing from AV1 LOBF streams).
+    fn buffered_bytes(&self) -> usize;
 }
 
 // ── H.264 splitter ─────────────────────────────────────────────────
@@ -729,6 +787,10 @@ impl H264Splitter {
 }
 
 impl FrameSplitter for H264Splitter {
+    fn buffered_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
@@ -848,6 +910,10 @@ impl HevcSplitter {
 }
 
 impl FrameSplitter for HevcSplitter {
+    fn buffered_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
@@ -1053,6 +1119,10 @@ impl Av1Splitter {
 }
 
 impl FrameSplitter for Av1Splitter {
+    fn buffered_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
     fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
         self.buf.extend_from_slice(data);
         self.extract_units()

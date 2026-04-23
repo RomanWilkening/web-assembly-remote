@@ -445,6 +445,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // Consume the immediate first tick so the first ping fires after 5 s.
         ping_interval.tick().await;
 
+        // ── Diagnostic counters (paired with `encoder-reader` log) ──
+        // A summary every 5 s lets us correlate "frames produced by the
+        // encoder" with "frames actually shipped to the client", which
+        // in turn rules out (or in) starvation between the encoder
+        // reader thread and the WebSocket writer.
+        let mut sent_frames: u64 = 0;
+        let mut sent_keys: u64 = 0;
+        let mut dropped_deltas: u64 = 0;
+        let mut diag_interval = time::interval(Duration::from_secs(5));
+        diag_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        diag_interval.tick().await;
+
         loop {
             tokio::select! {
                 // `biased;` makes the select arms be polled in source
@@ -478,6 +490,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     }
                 }
+                _ = diag_interval.tick() => {
+                    log::info!(
+                        "ws-sender: sent_frames={} (keys={}, dropped_intermediate_deltas={})",
+                        sent_frames,
+                        sent_keys,
+                        dropped_deltas
+                    );
+                }
                 Some(frame) = frame_rx.recv() => {
                     // ── Send-side newest-wins coalescing ────────────────
                     //
@@ -507,9 +527,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     while let Ok(next) = frame_rx.try_recv() {
                         if next.is_keyframe {
                             // Newer key supersedes any earlier key.
+                            if pending_key.is_some() {
+                                dropped_deltas += 1; // count superseded frame
+                            }
                             pending_key = Some(next);
                         } else {
                             // Newer delta supersedes any earlier delta.
+                            if pending_delta.is_some() {
+                                dropped_deltas += 1;
+                            }
                             pending_delta = Some(next);
                         }
                     }
@@ -523,8 +549,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         kf.data[0] = protocol::MSG_VIDEO_FRAME;
                         kf.data[1..9].copy_from_slice(&ts);
                         kf.data[9] = u8::from(kf.is_keyframe);
+                        let payload_len = kf.data.len();
                         if ws_tx.send(Message::Binary(kf.data)).await.is_err() {
                             break;
+                        }
+                        sent_frames += 1;
+                        sent_keys += 1;
+                        if sent_frames <= 2 {
+                            log::info!(
+                                "ws-sender: shipped frame #{} (key, {} bytes incl. header)",
+                                sent_frames,
+                                payload_len
+                            );
                         }
                     }
 
@@ -534,8 +570,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         df.data[0] = protocol::MSG_VIDEO_FRAME;
                         df.data[1..9].copy_from_slice(&ts);
                         df.data[9] = u8::from(df.is_keyframe);
+                        let payload_len = df.data.len();
                         if ws_tx.send(Message::Binary(df.data)).await.is_err() {
                             break;
+                        }
+                        sent_frames += 1;
+                        if sent_frames <= 2 {
+                            log::info!(
+                                "ws-sender: shipped frame #{} (delta, {} bytes incl. header)",
+                                sent_frames,
+                                payload_len
+                            );
                         }
                     }
                 }
