@@ -648,6 +648,9 @@ fn encoder_reader_loop(
     tx: mpsc::Sender<EncodedFrame>,
 ) {
     let mut buf = vec![0u8; 128 * 1024]; // 128 KiB read buffer
+    // Reusable output Vec for splitter::push.  Reused across every
+    // read so we don't allocate ~60 throwaway Vecs/s on the hot path.
+    let mut frames: Vec<EncodedFrame> = Vec::with_capacity(2);
 
     // ── Diagnostic counters ──────────────────────────────────────────
     // Help diagnose pipeline stalls (e.g. "first frame visible, then
@@ -678,7 +681,9 @@ fn encoder_reader_loop(
             }
             Ok(n) => {
                 bytes_read += n as u64;
-                for frame in splitter.push(&buf[..n]) {
+                frames.clear();
+                splitter.push(&buf[..n], &mut frames);
+                for frame in frames.drain(..) {
                     let was = frames_out;
                     frames_out += 1;
                     if frame.is_keyframe {
@@ -743,12 +748,18 @@ fn encoder_reader_loop(
 /// the encoder output stream and return one `EncodedFrame` per complete
 /// access unit (one per displayed picture).
 pub trait FrameSplitter: Send {
-    /// Append `data` to the internal buffer and return any complete
-    /// access units detected.  Implementations must reserve
+    /// Append `data` to the internal buffer and append any complete
+    /// access units detected to `out`.  Implementations must reserve
     /// `EncodedFrame::HEADER_LEN` bytes at the start of each emitted
     /// frame's `data` so the WebSocket sender can fill in the wire
     /// header in place.
-    fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame>;
+    ///
+    /// `out` is owned by the caller so the same `Vec` can be reused
+    /// across the encoder-reader's hot loop — at 60 fps this avoids
+    /// ~60 throwaway `Vec` allocations per second.  Implementations
+    /// must not clear `out` (the caller does that between iterations
+    /// when appropriate).
+    fn push(&mut self, data: &[u8], out: &mut Vec<EncodedFrame>);
 
     /// Number of bytes currently held in the splitter's internal buffer
     /// (i.e. bytes received from the encoder that have not yet been
@@ -870,9 +881,8 @@ impl FrameSplitter for H264Splitter {
         self.buf.len() - self.read_pos
     }
 
-    fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
+    fn push(&mut self, data: &[u8], out: &mut Vec<EncodedFrame>) {
         self.buf.extend_from_slice(data);
-        let mut frames = Vec::new();
 
         let mut search = self.read_pos;
         let mut prev_aud: Option<usize> = None;
@@ -888,7 +898,7 @@ impl FrameSplitter for H264Splitter {
                         );
                         data.resize(EncodedFrame::HEADER_LEN, 0);
                         data.extend_from_slice(au_slice);
-                        frames.push(EncodedFrame { data, is_keyframe: is_key });
+                        out.push(EncodedFrame { data, is_keyframe: is_key });
                     }
                 }
                 prev_aud = Some(aud_pos);
@@ -902,8 +912,6 @@ impl FrameSplitter for H264Splitter {
             self.read_pos = start;
             self.compact();
         }
-
-        frames
     }
 }
 
@@ -1009,9 +1017,8 @@ impl FrameSplitter for HevcSplitter {
         self.buf.len() - self.read_pos
     }
 
-    fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
+    fn push(&mut self, data: &[u8], out: &mut Vec<EncodedFrame>) {
         self.buf.extend_from_slice(data);
-        let mut frames = Vec::new();
 
         let mut search = self.read_pos;
         let mut prev_aud: Option<usize> = None;
@@ -1027,7 +1034,7 @@ impl FrameSplitter for HevcSplitter {
                         );
                         data.resize(EncodedFrame::HEADER_LEN, 0);
                         data.extend_from_slice(au_slice);
-                        frames.push(EncodedFrame { data, is_keyframe: is_key });
+                        out.push(EncodedFrame { data, is_keyframe: is_key });
                     }
                 }
                 prev_aud = Some(aud_pos);
@@ -1041,8 +1048,6 @@ impl FrameSplitter for HevcSplitter {
             self.read_pos = start;
             self.compact();
         }
-
-        frames
     }
 }
 
@@ -1117,11 +1122,10 @@ impl Av1Splitter {
         None
     }
 
-    /// Walk the OBU stream and return the byte ranges of complete
-    /// access units, plus a flag for whether each contains a key-frame.
+    /// Walk the OBU stream and append complete access units to `out`,
+    /// plus a flag for whether each contains a key-frame.
     /// Anything left over (incomplete trailing OBU) stays in `self.buf`.
-    fn extract_units(&mut self) -> Vec<EncodedFrame> {
-        let mut frames = Vec::new();
+    fn extract_units(&mut self, out: &mut Vec<EncodedFrame>) {
         let mut td_starts: Vec<usize> = Vec::new();
         let mut keyframe_units: Vec<bool> = Vec::new();
         let mut current_is_key = false;
@@ -1206,7 +1210,7 @@ impl Av1Splitter {
                     );
                     data.resize(EncodedFrame::HEADER_LEN, 0);
                     data.extend_from_slice(au_slice);
-                    frames.push(EncodedFrame {
+                    out.push(EncodedFrame {
                         data,
                         is_keyframe: keyframe_units[w],
                     });
@@ -1222,8 +1226,6 @@ impl Av1Splitter {
             self.read_pos = last_complete_end;
             self.compact();
         }
-
-        frames
     }
 }
 
@@ -1232,9 +1234,9 @@ impl FrameSplitter for Av1Splitter {
         self.buf.len() - self.read_pos
     }
 
-    fn push(&mut self, data: &[u8]) -> Vec<EncodedFrame> {
+    fn push(&mut self, data: &[u8], out: &mut Vec<EncodedFrame>) {
         self.buf.extend_from_slice(data);
-        self.extract_units()
+        self.extract_units(out);
     }
 }
 
@@ -1250,6 +1252,14 @@ mod tests {
         v
     }
 
+    /// Test helper: invoke `splitter.push` and return the access units
+    /// it appended, instead of having every test plumb its own `Vec`.
+    fn push_collect(s: &mut dyn FrameSplitter, data: &[u8]) -> Vec<EncodedFrame> {
+        let mut out = Vec::new();
+        s.push(data, &mut out);
+        out
+    }
+
     #[test]
     fn h264_detects_two_access_units_split_on_aud() {
         let mut det = H264Splitter::new();
@@ -1260,7 +1270,7 @@ mod tests {
         // Trailing AUD so the second AU is closed.
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09]);
 
-        let frames = det.push(&bytes);
+        let frames = push_collect(&mut det, &bytes);
         assert_eq!(frames.len(), 2);
         assert!(!frames[0].is_keyframe);
         assert!(frames[1].is_keyframe);
@@ -1283,7 +1293,7 @@ mod tests {
 
         let mut got = Vec::new();
         for b in &bytes {
-            got.extend(det.push(std::slice::from_ref(b)));
+            got.extend(push_collect(&mut det, std::slice::from_ref(b)));
         }
         assert_eq!(got.len(), 2);
         assert!(!got[0].is_keyframe);
@@ -1293,7 +1303,7 @@ mod tests {
     #[test]
     fn h264_no_aud_means_no_frames_emitted() {
         let mut det = H264Splitter::new();
-        let frames = det.push(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xff, 0xff]);
+        let frames = push_collect(&mut det, &[0x00, 0x00, 0x00, 0x01, 0x65, 0xff, 0xff]);
         assert!(frames.is_empty());
     }
 
@@ -1313,7 +1323,7 @@ mod tests {
         let trailing_aud = [0x00, 0x00, 0x00, 0x01, 0x09];
 
         // Prime with one open AU.
-        det.push(&au);
+        push_collect(&mut det, &au);
 
         // Feed 100 more (closing AUDs) — each push completes the prior
         // AU and starts a new one.  Without compaction the buffer would
@@ -1322,7 +1332,7 @@ mod tests {
             // Closing AUD for the previous AU + a fresh AU body.
             let mut chunk = trailing_aud.to_vec();
             chunk.extend_from_slice(&au[5..]); // body without leading AUD
-            let frames = det.push(&chunk);
+            let frames = push_collect(&mut det, &chunk);
             assert_eq!(frames.len(), 1);
         }
 
@@ -1353,7 +1363,7 @@ mod tests {
         // Trailing AUD so the second AU is closed.
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x46, 0x01]);
 
-        let frames = det.push(&bytes);
+        let frames = push_collect(&mut det, &bytes);
         assert_eq!(frames.len(), 2);
         assert!(!frames[0].is_keyframe);
         assert!(frames[1].is_keyframe);
@@ -1368,7 +1378,7 @@ mod tests {
 
         let mut got = Vec::new();
         for b in &bytes {
-            got.extend(det.push(std::slice::from_ref(b)));
+            got.extend(push_collect(&mut det, std::slice::from_ref(b)));
         }
         assert_eq!(got.len(), 2);
         assert!(!got[0].is_keyframe);
@@ -1401,7 +1411,7 @@ mod tests {
         // Third TD so the second TU is closed.
         bytes.extend_from_slice(&av1_obu(OBU_TEMPORAL_DELIMITER, &[]));
 
-        let frames = det.push(&bytes);
+        let frames = push_collect(&mut det, &bytes);
         assert_eq!(frames.len(), 2);
         assert!(frames[0].is_keyframe, "TU containing a Sequence Header must be flagged as keyframe");
         assert!(!frames[1].is_keyframe);
@@ -1423,7 +1433,7 @@ mod tests {
 
         let mut got = Vec::new();
         for b in &bytes {
-            got.extend(det.push(std::slice::from_ref(b)));
+            got.extend(push_collect(&mut det, std::slice::from_ref(b)));
         }
         assert_eq!(got.len(), 2);
         assert!(got[0].is_keyframe);

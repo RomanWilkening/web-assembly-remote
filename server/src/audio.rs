@@ -6,6 +6,15 @@ use tokio::sync::mpsc;
 /// 960 samples × 2 channels × 4 bytes = 7680 bytes.
 const CHUNK_BYTES: usize = 960 * 2 * 4;
 
+/// Audio chunks pushed onto the `audio_tx` channel are pre-framed with
+/// the `MSG_AUDIO_DATA` wire-protocol tag at index 0, so the WebSocket
+/// sender can ship the buffer with zero further allocations or copies
+/// (mirrors what the video path does with `EncodedFrame::HEADER_LEN`).
+///
+/// The capture loops therefore allocate `AUDIO_PREFIX_LEN + CHUNK_BYTES`
+/// per tick and place `protocol::MSG_AUDIO_DATA` at byte 0.
+pub const AUDIO_PREFIX_LEN: usize = 1;
+
 // ═══════════════════════════════════════════════════════════════════
 // Windows: WASAPI loopback capture
 //
@@ -186,18 +195,18 @@ fn run_wasapi_loopback(
             // second; small but unambiguously a win on the audio
             // hot-path.
             //
-            // We allocate the destination buffer with `to_vec()` rather
-            // than `vec![0u8; CHUNK_BYTES]` + copy: the latter does a
-            // 7.7 kB memset per 20 ms tick (~385 kB/s of zeroing) that
-            // is immediately overwritten by `copy_from_slice`.  Going
-            // through `to_vec()` collapses the allocation + memcpy into
-            // a single memory-bandwidth pass and keeps the audio thread
-            // out of the allocator's slow path that would otherwise
-            // contend with the video hot-path's allocations.
-            let chunk = {
+            // We also pre-prepend the `MSG_AUDIO_DATA` wire-protocol
+            // tag at byte 0 so the WebSocket sender can ship the
+            // buffer directly without going through
+            // `ServerMessage::AudioData::encode()`, which would
+            // otherwise allocate a fresh `Vec<u8>` and memcpy the
+            // full 7680-byte payload on every 20 ms tick.
+            let mut chunk = Vec::with_capacity(AUDIO_PREFIX_LEN + CHUNK_BYTES);
+            chunk.push(protocol::MSG_AUDIO_DATA);
+            {
                 let head = sample_queue.make_contiguous();
-                head[..CHUNK_BYTES].to_vec()
-            };
+                chunk.extend_from_slice(&head[..CHUNK_BYTES]);
+            }
             sample_queue.drain(..CHUNK_BYTES);
             if audio_tx.blocking_send(chunk).is_err() {
                 log::info!("Audio channel closed – stopping WASAPI loopback");
@@ -406,9 +415,17 @@ fn run_ffmpeg_capture(
         })?;
 
     // Read fixed-size chunks (20 ms each) from FFmpeg stdout.
+    //
+    // We allocate `AUDIO_PREFIX_LEN + CHUNK_BYTES` per chunk and place
+    // the `MSG_AUDIO_DATA` wire-protocol tag at byte 0, then read PCM
+    // straight into bytes `[1..]`.  This lets the WebSocket sender ship
+    // the buffer with a single zero-copy `Message::Binary(chunk)` call,
+    // bypassing `ServerMessage::AudioData::encode()` (which would
+    // otherwise allocate + memcpy the full 7680-byte payload per tick).
     loop {
-        let mut chunk = vec![0u8; CHUNK_BYTES];
-        if read_exact_or_eof(&mut stdout, &mut chunk)? == 0 {
+        let mut chunk = vec![0u8; AUDIO_PREFIX_LEN + CHUNK_BYTES];
+        chunk[0] = protocol::MSG_AUDIO_DATA;
+        if read_exact_or_eof(&mut stdout, &mut chunk[AUDIO_PREFIX_LEN..])? == 0 {
             log::info!("FFmpeg audio stdout closed");
             break;
         }

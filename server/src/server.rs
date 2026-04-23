@@ -479,9 +479,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Some(audio_data) = audio_rx.recv() => {
-                    let msg = protocol::ServerMessage::AudioData { data: audio_data };
-                    let bin = msg.encode();
-                    if ws_tx.send(Message::Binary(bin)).await.is_err() {
+                    // `audio_data` is already wire-framed by the
+                    // capture loop: byte 0 is `MSG_AUDIO_DATA`, bytes
+                    // 1.. are the raw PCM payload.  Ship it directly,
+                    // skipping the redundant
+                    // `ServerMessage::AudioData::encode()` round-trip
+                    // that would otherwise allocate a fresh ~7.7 kB
+                    // `Vec<u8>` on every 20 ms tick.
+                    debug_assert!(
+                        audio_data.first().copied() == Some(protocol::MSG_AUDIO_DATA),
+                        "audio chunk must be pre-framed with MSG_AUDIO_DATA tag",
+                    );
+                    if ws_tx.send(Message::Binary(audio_data)).await.is_err() {
                         break;
                     }
                 }
