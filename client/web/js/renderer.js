@@ -310,6 +310,13 @@ class WebGL2Backend {
     gl.disable(gl.BLEND);
 
     gl.viewport(0, 0, canvas.width, canvas.height);
+
+    // Last-known frame dimensions used to decide between `texImage2D`
+    // (re-allocates GPU storage) and `texSubImage2D` (writes into the
+    // existing storage).  Once the encoder settles on a resolution
+    // every subsequent frame hits the cheaper sub-image path.
+    this._texW = 0;
+    this._texH = 0;
   }
 
   resize(_w, _h) {
@@ -322,9 +329,27 @@ class WebGL2Backend {
     gl.bindTexture(gl.TEXTURE_2D, this._tex);
     // Zero-copy on Chrome/Edge: the VideoDecoder output surface is
     // uploaded straight to a GPU texture without going through CPU.
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame,
-    );
+    //
+    // We split the upload into "(re)allocate storage" and "write
+    // pixels" so that the steady-state path (frame dimensions stable)
+    // only does the latter.  `texImage2D` redefines the texture's
+    // mutable storage on every call, which forces the WebGL driver to
+    // re-validate format/size and may trigger an internal re-allocation
+    // even when the dimensions are unchanged; `texSubImage2D` skips
+    // both.  The Zero-Copy fast path applies equally to both calls.
+    const fw = frame.codedWidth || frame.displayWidth;
+    const fh = frame.codedHeight || frame.displayHeight;
+    if (fw !== this._texW || fh !== this._texH) {
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame,
+      );
+      this._texW = fw;
+      this._texH = fh;
+    } else {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, frame,
+      );
+    }
     gl.useProgram(this._program);
     gl.bindVertexArray(this._vao);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -338,6 +363,8 @@ class WebGL2Backend {
     this._tex = null;
     this._vao = null;
     this._program = null;
+    this._texW = 0;
+    this._texH = 0;
   }
 }
 

@@ -185,11 +185,19 @@ fn run_wasapi_loopback(
             // byte.  At 96 kB/s this saves ~96k VecDeque pops per
             // second; small but unambiguously a win on the audio
             // hot-path.
-            let mut chunk = vec![0u8; CHUNK_BYTES];
-            {
+            //
+            // We allocate the destination buffer with `to_vec()` rather
+            // than `vec![0u8; CHUNK_BYTES]` + copy: the latter does a
+            // 7.7 kB memset per 20 ms tick (~385 kB/s of zeroing) that
+            // is immediately overwritten by `copy_from_slice`.  Going
+            // through `to_vec()` collapses the allocation + memcpy into
+            // a single memory-bandwidth pass and keeps the audio thread
+            // out of the allocator's slow path that would otherwise
+            // contend with the video hot-path's allocations.
+            let chunk = {
                 let head = sample_queue.make_contiguous();
-                chunk.copy_from_slice(&head[..CHUNK_BYTES]);
-            }
+                head[..CHUNK_BYTES].to_vec()
+            };
             sample_queue.drain(..CHUNK_BYTES);
             if audio_tx.blocking_send(chunk).is_err() {
                 log::info!("Audio channel closed – stopping WASAPI loopback");
