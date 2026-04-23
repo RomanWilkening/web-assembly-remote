@@ -418,6 +418,21 @@ impl FfmpegEncoder {
             "-g", &gop,
             "-fflags", "nobuffer",
             "-flags", "low_delay",
+            // CRITICAL for low-latency pipe output: by default FFmpeg's
+            // muxer (and the underlying libc stdio writer for pipe:1)
+            // accumulates 4–8 KiB before flushing.  At 60 fps a static
+            // desktop produces H.264 delta frames well below 100 bytes
+            // each, which means the first IDR (50–200 KiB) pushes
+            // through immediately but subsequent delta frames sit in
+            // the buffer for *seconds* — exactly the symptom of "first
+            // frame visible, then 'No video frame received for 5000ms'
+            // on the client".  `-flush_packets 1` forces the muxer to
+            // flush after every packet, so each encoded frame reaches
+            // our reader thread as soon as the encoder produces it.
+            // Note: `-fflags nobuffer` and `-flags low_delay` above
+            // affect the *input* demuxer / decoder reorder queue, not
+            // the output writer, so this flag is independently needed.
+            "-flush_packets", "1",
         ]);
 
         // Codec-specific access-unit framing on the output side.  The
