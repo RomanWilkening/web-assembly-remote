@@ -245,6 +245,15 @@ impl FfmpegEncoder {
                     "-c:v", "h264_amf",
                     "-usage", "ultralowlatency",
                     "-quality", "speed",
+                    // h264_amf silently ignores `-g` and the universal
+                    // `-force_key_frames` expression unless `-forced_idr`
+                    // is explicitly enabled — without it, requested
+                    // key-frames are at most non-IDR I-slices and the
+                    // client decoder cannot use them to resync.  See the
+                    // discussion in the common output-flags block where
+                    // `-force_key_frames "expr:gte(t,n_forced*1)"` is
+                    // configured.
+                    "-forced_idr", "1",
                 ]);
                 amf_rc(&mut cmd, &["-qp_i", "-qp_p"]);
                 cmd.args([
@@ -260,6 +269,8 @@ impl FfmpegEncoder {
                     "-c:v", "hevc_amf",
                     "-usage", "ultralowlatency",
                     "-quality", "speed",
+                    // See the comment on h264_amf above — same quirk.
+                    "-forced_idr", "1",
                 ]);
                 amf_rc(&mut cmd, &["-qp_i", "-qp_p"]);
                 cmd.args([
@@ -275,6 +286,8 @@ impl FfmpegEncoder {
                     "-c:v", "av1_amf",
                     "-usage", "ultralowlatency",
                     "-quality", "speed",
+                    // See the comment on h264_amf above — same quirk.
+                    "-forced_idr", "1",
                 ]);
                 // av1_amf uses `-qp_i / -qp_p` like the H.264/HEVC AMF
                 // encoders.  Slicing flag is not honoured by AV1.
