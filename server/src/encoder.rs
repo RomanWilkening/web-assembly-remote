@@ -413,10 +413,26 @@ impl FfmpegEncoder {
         }
 
         // ── common output flags ────────────────────────────────
-        let gop = (cfg.fps * 2).to_string(); // key-frame every 2 seconds
+        // Key-frame cadence: every 1 second.  Two mechanisms are used
+        // belt-and-suspenders:
+        //
+        //   * `-g {fps}` sets the encoder's internal GOP size so the
+        //     rate-control budget is sized for ~1 IDR/s.
+        //   * `-force_key_frames` is an FFmpeg-level mechanism that
+        //     marks every Nth input frame for IDR encoding regardless
+        //     of whether the underlying encoder honours `-g` (some
+        //     hardware encoders, notably h264_amf on certain AMD
+        //     drivers, ignore `-g` and produce a single IDR at the
+        //     start of the stream — leaving the client decoder unable
+        //     to recover whenever the ws-sender drops an intermediate
+        //     P-frame, since each P-frame references the previous one).
+        //     With a 1-second IDR cadence the decoder resyncs at most
+        //     ~1 s after any dropped delta and keeps producing frames.
+        let gop = cfg.fps.to_string(); // key-frame every 1 second
         cmd.args([
             "-bf", "0",               // no B-frames
             "-g", &gop,
+            "-force_key_frames", "expr:gte(t,n_forced*1)",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
             // CRITICAL for low-latency pipe output: by default FFmpeg's
@@ -632,6 +648,7 @@ fn encoder_reader_loop(
     // working pipeline shows up in the log without waiting 5 s.
     let mut bytes_read: u64 = 0;
     let mut frames_out: u64 = 0;
+    let mut keys_out: u64 = 0;
     let mut last_report = Instant::now();
     let report_every = Duration::from_secs(5);
 
@@ -639,9 +656,10 @@ fn encoder_reader_loop(
         match stdout.read(&mut buf) {
             Ok(0) => {
                 log::info!(
-                    "FFmpeg stdout closed (bytes_read={}, frames_out={})",
+                    "FFmpeg stdout closed (bytes_read={}, frames_out={}, keys_out={})",
                     bytes_read,
-                    frames_out
+                    frames_out,
+                    keys_out
                 );
                 break;
             }
@@ -650,6 +668,9 @@ fn encoder_reader_loop(
                 for frame in splitter.push(&buf[..n]) {
                     let was = frames_out;
                     frames_out += 1;
+                    if frame.is_keyframe {
+                        keys_out += 1;
+                    }
                     if was < 2 {
                         log::info!(
                             "encoder-reader: emitted frame #{} ({} bytes payload, key={})",
@@ -657,21 +678,34 @@ fn encoder_reader_loop(
                             frame.data.len() - EncodedFrame::HEADER_LEN,
                             frame.is_keyframe
                         );
+                    } else if frame.is_keyframe {
+                        // Log every keyframe past the initial pair so an
+                        // operator can verify the encoder is honouring the
+                        // requested IDR cadence (some hardware encoders
+                        // ignore `-g` and need `-force_key_frames`).
+                        log::info!(
+                            "encoder-reader: emitted KEY frame #{} (#{} key, {} bytes payload)",
+                            frames_out,
+                            keys_out,
+                            frame.data.len() - EncodedFrame::HEADER_LEN,
+                        );
                     }
                     if tx.blocking_send(frame).is_err() {
                         log::info!(
-                            "Frame channel closed – stopping reader (bytes_read={}, frames_out={})",
+                            "Frame channel closed – stopping reader (bytes_read={}, frames_out={}, keys_out={})",
                             bytes_read,
-                            frames_out
+                            frames_out,
+                            keys_out
                         );
                         return;
                     }
                 }
                 if last_report.elapsed() >= report_every {
                     log::info!(
-                        "encoder-reader: bytes_read={}, frames_out={}, splitter_buf={}",
+                        "encoder-reader: bytes_read={}, frames_out={}, keys_out={}, splitter_buf={}",
                         bytes_read,
                         frames_out,
+                        keys_out,
                         splitter.buffered_bytes(),
                     );
                     last_report = Instant::now();
@@ -679,9 +713,10 @@ fn encoder_reader_loop(
             }
             Err(e) => {
                 log::error!(
-                    "FFmpeg read error: {e} (bytes_read={}, frames_out={})",
+                    "FFmpeg read error: {e} (bytes_read={}, frames_out={}, keys_out={})",
                     bytes_read,
-                    frames_out
+                    frames_out,
+                    keys_out
                 );
                 break;
             }
