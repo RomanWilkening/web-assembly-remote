@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{net::SocketAddr, time::Instant};
+use std::{collections::VecDeque, net::SocketAddr, time::Instant};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tower_http::services::ServeDir;
@@ -499,69 +499,71 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     );
                 }
                 Some(frame) = frame_rx.recv() => {
-                    // ── Send-side newest-wins coalescing ────────────────
+                    // ── IDR-aware drop policy ──────────────────────────
                     //
-                    // If multiple frames piled up in the channel while the
-                    // previous WebSocket write was in flight (typical on a
-                    // congested Wi-Fi or after a TCP retransmit) we want
-                    // to discard the *intermediate* delta frames and only
-                    // ship the most recent picture — the user only sees
-                    // the latest frame anyway, and dropping the stale
-                    // ones recovers latency immediately.
+                    // We must NEVER drop a P-frame in isolation: P-frames
+                    // reference previous frames, and a WebCodecs (or any
+                    // standards-compliant) decoder fed a P-frame whose
+                    // predecessor was dropped will silently produce no
+                    // output until the next IDR.  An earlier "newest-wins
+                    // delta coalescer" did exactly this and reduced the
+                    // perceived frame rate to ~1 fps (the IDR cadence).
                     //
-                    // Key-frames are NEVER dropped: losing one would leave
-                    // the decoder unable to recover until the next IDR
-                    // (~2 s with the current GOP), which is far worse
-                    // than carrying one extra frame of delay.
+                    // The only safe drop is a *whole sub-GOP*: if a
+                    // newer IDR is already queued behind us, every frame
+                    // currently in front of that IDR is about to be
+                    // invalidated by the IDR's full decoder reset, so
+                    // skipping straight to the IDR is lossless and
+                    // recovers latency.  We therefore peek ahead with
+                    // `try_recv` and, *only* when we find a newer IDR,
+                    // discard the queued head and ship the IDR first.
                     //
-                    // Pending state is tracked as `Option<EncodedFrame>`
-                    // so we can keep the latest of each kind without an
-                    // intermediate placeholder allocation.
-                    let mut pending_key: Option<EncodedFrame> = None;
-                    let mut pending_delta: Option<EncodedFrame> = None;
-                    if frame.is_keyframe {
-                        pending_key = Some(frame);
-                    } else {
-                        pending_delta = Some(frame);
-                    }
+                    // Backpressure on a slow link is handled by the
+                    // WebSocket sink itself — `ws_tx.send().await`
+                    // suspends until the OS write buffer drains, which
+                    // naturally rate-limits the encoder via the bounded
+                    // `frame_rx` channel.
+                    let mut to_send: VecDeque<EncodedFrame> = VecDeque::new();
+                    to_send.push_back(frame);
+                    // Drain whatever is already queued so we can spot a
+                    // newer IDR without blocking.
                     while let Ok(next) = frame_rx.try_recv() {
                         if next.is_keyframe {
-                            // Newer key supersedes any earlier key.
-                            if pending_key.is_some() {
-                                dropped_deltas += 1; // count superseded frame
-                            }
-                            pending_key = Some(next);
-                        } else {
-                            // Newer delta supersedes any earlier delta.
-                            if pending_delta.is_some() {
-                                dropped_deltas += 1;
-                            }
-                            pending_delta = Some(next);
+                            // Everything queued so far is about to be
+                            // superseded by this IDR's decoder reset —
+                            // safe to drop it all.
+                            dropped_deltas += to_send.len() as u64;
+                            to_send.clear();
                         }
+                        to_send.push_back(next);
                     }
 
-                    // Send the (possibly skipped-ahead) key frame first
-                    // so the decoder can consume it before the latest
-                    // delta.
-                    if let Some(mut kf) = pending_key {
-                        debug_assert!(kf.data.len() >= EncodedFrame::HEADER_LEN);
+                    while let Some(mut f) = to_send.pop_front() {
+                        debug_assert!(f.data.len() >= EncodedFrame::HEADER_LEN);
+                        let is_key = f.is_keyframe;
                         let ts = timestamp_us().to_le_bytes();
-                        kf.data[0] = protocol::MSG_VIDEO_FRAME;
-                        kf.data[1..9].copy_from_slice(&ts);
-                        kf.data[9] = u8::from(kf.is_keyframe);
-                        let payload_len = kf.data.len();
-                        if ws_tx.send(Message::Binary(kf.data)).await.is_err() {
-                            break;
+                        f.data[0] = protocol::MSG_VIDEO_FRAME;
+                        f.data[1..9].copy_from_slice(&ts);
+                        f.data[9] = u8::from(is_key);
+                        let payload_len = f.data.len();
+                        if ws_tx.send(Message::Binary(f.data)).await.is_err() {
+                            // Inner `while let` would only break the
+                            // drain loop, not the outer select loop —
+                            // exit the whole sender task instead.
+                            return;
                         }
                         sent_frames += 1;
-                        sent_keys += 1;
+                        if is_key {
+                            sent_keys += 1;
+                        }
                         if sent_frames <= 2 {
                             log::info!(
-                                "ws-sender: shipped frame #{} (key, {} bytes incl. header)",
+                                "ws-sender: shipped frame #{} ({}, {} bytes incl. header)",
                                 sent_frames,
+                                if is_key { "key" } else { "delta" },
                                 payload_len
                             );
-                        } else {
+                        } else if is_key {
                             // Mirror the encoder-reader's per-keyframe log
                             // (see `encoder_reader_loop`) so an operator can
                             // correlate "encoder-reader: emitted KEY frame
@@ -570,26 +572,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 "ws-sender: shipped KEY frame #{} (#{} key, {} bytes incl. header)",
                                 sent_frames,
                                 sent_keys,
-                                payload_len
-                            );
-                        }
-                    }
-
-                    if let Some(mut df) = pending_delta {
-                        debug_assert!(df.data.len() >= EncodedFrame::HEADER_LEN);
-                        let ts = timestamp_us().to_le_bytes();
-                        df.data[0] = protocol::MSG_VIDEO_FRAME;
-                        df.data[1..9].copy_from_slice(&ts);
-                        df.data[9] = u8::from(df.is_keyframe);
-                        let payload_len = df.data.len();
-                        if ws_tx.send(Message::Binary(df.data)).await.is_err() {
-                            break;
-                        }
-                        sent_frames += 1;
-                        if sent_frames <= 2 {
-                            log::info!(
-                                "ws-sender: shipped frame #{} (delta, {} bytes incl. header)",
-                                sent_frames,
                                 payload_len
                             );
                         }
