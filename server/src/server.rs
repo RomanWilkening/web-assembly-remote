@@ -695,11 +695,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         sent_keys,
                         dropped_deltas
                     );
+                    // Round to nearest integer FPS instead of truncating
+                    // (a 3-fps sender would otherwise report 0 fps).
                     let delta = sent_frames.saturating_sub(last_sent_frames);
                     last_sent_frames = sent_frames;
+                    let fps_rounded = (delta + 2) / 5;
                     diagnostics
                         .current_fps
-                        .store(delta / 5, Ordering::Relaxed);
+                        .store(fps_rounded, Ordering::Relaxed);
                 }
                 Some(frame) = frame_rx.recv() => {
                     // ── IDR-aware drop policy ──────────────────────────

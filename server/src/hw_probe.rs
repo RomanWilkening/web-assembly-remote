@@ -212,7 +212,7 @@ fn try_one_frame(encoder: &str, timeout: Duration) -> Result<(), String> {
                 }
                 return Err(format!(
                     "encode probe exited {status} ({})",
-                    stderr.lines().last().unwrap_or("").trim()
+                    stderr.lines().last().unwrap_or("")
                 ));
             }
             Ok(None) if std::time::Instant::now() >= deadline => {

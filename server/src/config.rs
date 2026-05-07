@@ -214,10 +214,8 @@ impl AppConfig {
     /// Look up the named profile (or the configured `default_profile`
     /// when `name` is `None`).
     pub fn profile(&self, name: Option<&str>) -> Option<&EncoderProfile> {
-        let key = name
-            .map(|s| s.to_string())
-            .or_else(|| self.encoder.default_profile.clone())?;
-        self.encoder.profiles.get(&key)
+        let key = name.or(self.encoder.default_profile.as_deref())?;
+        self.encoder.profiles.get(key)
     }
 }
 
