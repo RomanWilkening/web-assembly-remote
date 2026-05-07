@@ -16,11 +16,13 @@ use tower_http::services::ServeDir;
 
 use crate::auth::{self, AuthState};
 use crate::capture::{self, ScreenCapture};
-use crate::config::AuthConfig;
+use crate::config::{AppConfig, AuthConfig};
 use crate::cursor;
 use crate::encoder::{Chroma, CodecKind, EncodedFrame, EncoderConfig, FfmpegEncoder};
+use crate::hw_probe::{self, EncoderCapability};
 use crate::input::InputSimulator;
 use crate::audio;
+use std::sync::Arc;
 
 pub struct ServerConfig {
     pub addr: SocketAddr,
@@ -34,6 +36,9 @@ pub struct ServerConfig {
     pub static_dir: String,
     pub auth: AuthConfig,
     pub audio_device: Option<String>,
+    /// Full parsed `config.toml` for reading profile data and
+    /// `[encoder]` settings at runtime.
+    pub app_config: Arc<AppConfig>,
 }
 
 #[derive(Clone)]
@@ -47,6 +52,9 @@ struct AppState {
     bitrate_kbps: Option<u32>,
     auth: AuthState,
     audio_device: Option<String>,
+    app_config: Arc<AppConfig>,
+    /// Hardware-probed encoder list, computed once at server startup.
+    encoder_caps: Arc<Vec<EncoderCapability>>,
 }
 
 impl axum::extract::FromRef<AppState> for AuthState {
@@ -55,8 +63,42 @@ impl axum::extract::FromRef<AppState> for AuthState {
     }
 }
 
+/// Map [`crate::encoder::backends::HwVendor`] to the byte sent on the
+/// wire in `EncoderList`.  Stable; matches the documentation in
+/// [`protocol::EncoderInfo::hw_vendor`].
+fn hw_vendor_to_id(v: crate::encoder::backends::HwVendor) -> u8 {
+    use crate::encoder::backends::HwVendor::*;
+    match v {
+        Amd => 0,
+        Nvidia => 1,
+        Intel => 2,
+        Microsoft => 3,
+        Software => 4,
+        Other => 5,
+    }
+}
+
 pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let auth_state = AuthState::new(&cfg.auth);
+
+    // Hardware probing — runs once at server startup.  Findings drive
+    // both the `MSG_ENCODER_LIST` payload sent to every client and (when
+    // `[encoder].auto_select = true`) the runtime default encoder
+    // selection.
+    let encoder_caps = tokio::task::spawn_blocking(hw_probe::probe)
+        .await
+        .unwrap_or_default();
+    log::info!(
+        "Hardware probe: {} known encoders, {} working",
+        encoder_caps.len(),
+        encoder_caps.iter().filter(|c| c.working).count(),
+    );
+    for c in &encoder_caps {
+        if c.working {
+            log::info!("  encoder available: {} ({:?}, vendor={:?})",
+                c.name, c.codec, c.hw_vendor);
+        }
+    }
 
     let state = AppState {
         fps: cfg.fps,
@@ -68,6 +110,8 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         bitrate_kbps: cfg.bitrate_kbps,
         auth: auth_state.clone(),
         audio_device: cfg.audio_device,
+        app_config: cfg.app_config,
+        encoder_caps: Arc::new(encoder_caps),
     };
 
     let app = Router::new()
@@ -178,6 +222,69 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .is_err()
     {
         log::error!("Failed to send AudioDeviceList – client disconnected");
+        return;
+    }
+
+    // ── 0c. Send EncoderList (Block A) ─────────────────────────
+    let active_encoder_name = state.encoder.clone();
+    let encoder_list: Vec<protocol::EncoderInfo> = state
+        .encoder_caps
+        .iter()
+        .filter(|c| c.working)
+        .take(255)
+        .enumerate()
+        .map(|(i, c)| protocol::EncoderInfo {
+            index: i as u8,
+            name: c.name.clone(),
+            codec: c.codec.protocol_id(),
+            hw_vendor: hw_vendor_to_id(c.hw_vendor),
+            active: c.name == active_encoder_name,
+        })
+        .collect();
+    let encoder_list_msg = protocol::ServerMessage::EncoderList {
+        encoders: encoder_list,
+    };
+    log::info!(
+        "Sending EncoderList: {} working encoder(s)",
+        state.encoder_caps.iter().filter(|c| c.working).count(),
+    );
+    if ws_tx
+        .send(Message::Binary(encoder_list_msg.encode().into()))
+        .await
+        .is_err()
+    {
+        log::error!("Failed to send EncoderList – client disconnected");
+        return;
+    }
+
+    // ── 0d. Send ProfileList ───────────────────────────────────
+    let active_profile = state.app_config.encoder.default_profile.clone();
+    let profile_list: Vec<protocol::ProfileInfo> = state
+        .app_config
+        .encoder
+        .profiles
+        .keys()
+        .take(255)
+        .enumerate()
+        .map(|(i, name)| protocol::ProfileInfo {
+            index: i as u8,
+            name: name.clone(),
+            active: active_profile.as_deref() == Some(name.as_str()),
+        })
+        .collect();
+    let profile_list_msg = protocol::ServerMessage::ProfileList {
+        profiles: profile_list,
+    };
+    log::info!(
+        "Sending ProfileList: {} profile(s)",
+        state.app_config.encoder.profiles.len(),
+    );
+    if ws_tx
+        .send(Message::Binary(profile_list_msg.encode().into()))
+        .await
+        .is_err()
+    {
+        log::error!("Failed to send ProfileList – client disconnected");
         return;
     }
 
@@ -429,6 +536,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     // SelectAudio is handled in the WS receiver, not here.
                     protocol::ClientMessage::SelectAudio { .. } => {}
+                    // Encoder/profile switching at runtime requires a
+                    // full encoder-pipeline restart (the FFmpeg process
+                    // cannot reconfigure mid-stream for most backends).
+                    // The client should disconnect+reconnect after sending
+                    // the request, mirroring the SelectMonitor behaviour.
+                    // We log the request so operators can correlate with
+                    // any subsequent reconnect.
+                    protocol::ClientMessage::SelectEncoder { index } => {
+                        log::info!(
+                            "SelectEncoder({index}) – client should reconnect to apply"
+                        );
+                    }
+                    protocol::ClientMessage::SelectProfile { index } => {
+                        log::info!(
+                            "SelectProfile({index}) – client should reconnect to apply"
+                        );
+                    }
                     other => input_sim.handle(other),
                 }
             }

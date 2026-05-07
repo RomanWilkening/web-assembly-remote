@@ -13,6 +13,8 @@ pub const MSG_MONITOR_LIST: u8 = 0x04;
 pub const MSG_AUDIO_DATA: u8 = 0x05;
 pub const MSG_AUDIO_DEVICE_LIST: u8 = 0x06;
 pub const MSG_PONG: u8 = 0x07;
+pub const MSG_ENCODER_LIST: u8 = 0x08;
+pub const MSG_PROFILE_LIST: u8 = 0x09;
 
 // Client → Server
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -25,6 +27,8 @@ pub const MSG_SELECT_AUDIO: u8 = 0x16;
 pub const MSG_KEY_SCANCODE: u8 = 0x17;
 pub const MSG_SET_KEYBOARD_LAYOUT: u8 = 0x18;
 pub const MSG_PING: u8 = 0x19;
+pub const MSG_SELECT_ENCODER: u8 = 0x1A;
+pub const MSG_SELECT_PROFILE: u8 = 0x1B;
 
 // --- Monitor info ---
 
@@ -43,6 +47,41 @@ pub struct MonitorInfo {
     pub height: u16,
     /// True if this is the primary monitor.
     pub primary: bool,
+}
+
+// --- Encoder info (Block A) ---
+
+/// Information about one FFmpeg encoder the server has probed at startup.
+///
+/// Sent in [`ServerMessage::EncoderList`] so the client toolbar can
+/// populate its "Encoder" dropdown with **only** the encoders that work
+/// on this particular machine — manual `--encoder h264_amf` guessing
+/// is no longer required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderInfo {
+    /// Stable index assigned by the server for use in
+    /// [`ClientMessage::SelectEncoder`].
+    pub index: u8,
+    /// FFmpeg encoder name, e.g. `"h264_amf"`, `"libsvtav1"`.
+    pub name: String,
+    /// Codec family: `0` = H.264, `1` = HEVC, `2` = AV1
+    /// (matches `CodecKind::protocol_id`).
+    pub codec: u8,
+    /// Hardware vendor: `0` = AMD, `1` = NVIDIA, `2` = Intel,
+    /// `3` = Microsoft (MF), `4` = Software, `5` = Other.
+    pub hw_vendor: u8,
+    /// True if the encoder is currently the active one.
+    pub active: bool,
+}
+
+/// Information about one named encoder profile from `[encoder.profiles.*]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub index: u8,
+    /// Profile name, e.g. `"gaming"`, `"office"`.
+    pub name: String,
+    /// True if this profile is the active one.
+    pub active: bool,
 }
 
 // --- Audio device info ---
@@ -108,6 +147,19 @@ pub enum ServerMessage {
         /// The exact value the client sent in `ClientMessage::Ping`.
         client_ts_us: u64,
     },
+    /// List of FFmpeg encoders that the server has probed and confirmed
+    /// to work on this machine.  Sent once after `ServerInfo` so the
+    /// client toolbar can populate its "Encoder" dropdown.  Older
+    /// clients ignore the unknown message ID per the wire-protocol
+    /// forward-compatibility rules.
+    EncoderList {
+        encoders: Vec<EncoderInfo>,
+    },
+    /// List of named encoder profiles configured on the server.  Sent
+    /// once after `EncoderList`; same forward-compatibility story.
+    ProfileList {
+        profiles: Vec<ProfileInfo>,
+    },
 }
 
 // --- Client messages ---
@@ -140,6 +192,15 @@ pub enum ClientMessage {
     /// `ServerMessage::Pong` echoing `client_ts_us` verbatim so the
     /// client can compute RTT against its own clock.
     Ping { client_ts_us: u64 },
+    /// Switch the live encoder to the one at `index` in the most-recent
+    /// `EncoderList`.  The server may ignore the request when the
+    /// requested encoder is no longer available; nothing visible to the
+    /// client breaks if it is.
+    SelectEncoder { index: u8 },
+    /// Switch the live encoder to the named profile from
+    /// `[encoder.profiles.*]` at `index` in the most-recent
+    /// `ProfileList`.
+    SelectProfile { index: u8 },
 }
 
 // --- Encoding ---
@@ -212,6 +273,39 @@ impl ServerMessage {
                 buf.extend_from_slice(&client_ts_us.to_le_bytes());
                 buf
             }
+            ServerMessage::EncoderList { encoders } => {
+                // [0x08] [count: u8] [for each:
+                //   index u8, codec u8, hw_vendor u8, active u8,
+                //   name_len u16, name bytes...]
+                let mut buf = Vec::with_capacity(2 + encoders.len() * 32);
+                buf.push(MSG_ENCODER_LIST);
+                buf.push(encoders.len() as u8);
+                for e in encoders {
+                    buf.push(e.index);
+                    buf.push(e.codec);
+                    buf.push(e.hw_vendor);
+                    buf.push(u8::from(e.active));
+                    let name_bytes = e.name.as_bytes();
+                    buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(name_bytes);
+                }
+                buf
+            }
+            ServerMessage::ProfileList { profiles } => {
+                // [0x09] [count: u8] [for each:
+                //   index u8, active u8, name_len u16, name bytes...]
+                let mut buf = Vec::with_capacity(2 + profiles.len() * 16);
+                buf.push(MSG_PROFILE_LIST);
+                buf.push(profiles.len() as u8);
+                for p in profiles {
+                    buf.push(p.index);
+                    buf.push(u8::from(p.active));
+                    let name_bytes = p.name.as_bytes();
+                    buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(name_bytes);
+                }
+                buf
+            }
         }
     }
 }
@@ -277,6 +371,12 @@ impl ClientMessage {
                 buf.push(MSG_PING);
                 buf.extend_from_slice(&client_ts_us.to_le_bytes());
                 buf
+            }
+            ClientMessage::SelectEncoder { index } => {
+                vec![MSG_SELECT_ENCODER, *index]
+            }
+            ClientMessage::SelectProfile { index } => {
+                vec![MSG_SELECT_PROFILE, *index]
             }
         }
     }
@@ -364,6 +464,54 @@ impl ServerMessage {
                 let client_ts_us = u64::from_le_bytes(data[1..9].try_into().ok()?);
                 Some(ServerMessage::Pong { client_ts_us })
             }
+            MSG_ENCODER_LIST if data.len() >= 2 => {
+                let count = data[1] as usize;
+                let mut encoders = Vec::with_capacity(count);
+                let mut pos = 2;
+                for _ in 0..count {
+                    if pos + 6 > data.len() {
+                        return None;
+                    }
+                    let index = data[pos];
+                    let codec = data[pos + 1];
+                    let hw_vendor = data[pos + 2];
+                    let active = data[pos + 3] != 0;
+                    let name_len = u16::from_le_bytes(
+                        data[pos + 4..pos + 6].try_into().ok()?,
+                    ) as usize;
+                    pos += 6;
+                    if pos + name_len > data.len() {
+                        return None;
+                    }
+                    let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+                    pos += name_len;
+                    encoders.push(EncoderInfo { index, name, codec, hw_vendor, active });
+                }
+                Some(ServerMessage::EncoderList { encoders })
+            }
+            MSG_PROFILE_LIST if data.len() >= 2 => {
+                let count = data[1] as usize;
+                let mut profiles = Vec::with_capacity(count);
+                let mut pos = 2;
+                for _ in 0..count {
+                    if pos + 4 > data.len() {
+                        return None;
+                    }
+                    let index = data[pos];
+                    let active = data[pos + 1] != 0;
+                    let name_len = u16::from_le_bytes(
+                        data[pos + 2..pos + 4].try_into().ok()?,
+                    ) as usize;
+                    pos += 4;
+                    if pos + name_len > data.len() {
+                        return None;
+                    }
+                    let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+                    pos += name_len;
+                    profiles.push(ProfileInfo { index, name, active });
+                }
+                Some(ServerMessage::ProfileList { profiles })
+            }
             _ => None,
         }
     }
@@ -417,6 +565,12 @@ impl ClientMessage {
             MSG_PING if data.len() >= 9 => {
                 let client_ts_us = u64::from_le_bytes(data[1..9].try_into().ok()?);
                 Some(ClientMessage::Ping { client_ts_us })
+            }
+            MSG_SELECT_ENCODER if data.len() >= 2 => {
+                Some(ClientMessage::SelectEncoder { index: data[1] })
+            }
+            MSG_SELECT_PROFILE if data.len() >= 2 => {
+                Some(ClientMessage::SelectProfile { index: data[1] })
             }
             _ => None,
         }
@@ -700,5 +854,113 @@ mod tests {
             ClientMessage::SelectAudio { index } => assert_eq!(index, 0xFF),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn roundtrip_encoder_list() {
+        let msg = ServerMessage::EncoderList {
+            encoders: vec![
+                EncoderInfo {
+                    index: 0,
+                    name: "h264_amf".into(),
+                    codec: 0,
+                    hw_vendor: 0,
+                    active: true,
+                },
+                EncoderInfo {
+                    index: 1,
+                    name: "libsvtav1".into(),
+                    codec: 2,
+                    hw_vendor: 4,
+                    active: false,
+                },
+            ],
+        };
+        let encoded = msg.encode();
+        let decoded = ServerMessage::decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::EncoderList { encoders } => {
+                assert_eq!(encoders.len(), 2);
+                assert_eq!(encoders[0].name, "h264_amf");
+                assert!(encoders[0].active);
+                assert_eq!(encoders[1].codec, 2);
+                assert_eq!(encoders[1].hw_vendor, 4);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_encoder_list_empty() {
+        let msg = ServerMessage::EncoderList { encoders: vec![] };
+        let decoded = ServerMessage::decode(&msg.encode()).unwrap();
+        match decoded {
+            ServerMessage::EncoderList { encoders } => assert!(encoders.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_profile_list() {
+        let msg = ServerMessage::ProfileList {
+            profiles: vec![
+                ProfileInfo { index: 0, name: "gaming".into(), active: true },
+                ProfileInfo { index: 1, name: "office".into(), active: false },
+            ],
+        };
+        let decoded = ServerMessage::decode(&msg.encode()).unwrap();
+        match decoded {
+            ServerMessage::ProfileList { profiles } => {
+                assert_eq!(profiles.len(), 2);
+                assert_eq!(profiles[0].name, "gaming");
+                assert!(profiles[0].active);
+                assert_eq!(profiles[1].name, "office");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_select_encoder() {
+        let msg = ClientMessage::SelectEncoder { index: 5 };
+        match ClientMessage::decode(&msg.encode()).unwrap() {
+            ClientMessage::SelectEncoder { index } => assert_eq!(index, 5),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_select_profile() {
+        let msg = ClientMessage::SelectProfile { index: 2 };
+        match ClientMessage::decode(&msg.encode()).unwrap() {
+            ClientMessage::SelectProfile { index } => assert_eq!(index, 2),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Older clients must keep working: when the server sends a future
+    /// message ID they don't recognise, `decode` returns `None` and the
+    /// dispatcher silently skips it.  This test pins that contract.
+    #[test]
+    fn unknown_message_id_decodes_to_none() {
+        // 0xFE is reserved / future use.
+        assert!(ServerMessage::decode(&[0xFE, 0, 0, 0]).is_none());
+        assert!(ClientMessage::decode(&[0xFE, 0, 0, 0]).is_none());
+    }
+
+    /// Truncated EncoderList payloads must not panic — `decode` returns
+    /// `None` and the caller skips the bad message.
+    #[test]
+    fn encoder_list_truncated_decodes_to_none() {
+        // Says count=2 but contains only enough bytes for one entry header.
+        let bytes = [MSG_ENCODER_LIST, 2, 0, 0, 0, 0, 4, 0];
+        assert!(ServerMessage::decode(&bytes).is_none());
+    }
+
+    /// Truncated ProfileList payloads must not panic.
+    #[test]
+    fn profile_list_truncated_decodes_to_none() {
+        let bytes = [MSG_PROFILE_LIST, 5, 0, 1];
+        assert!(ServerMessage::decode(&bytes).is_none());
     }
 }

@@ -26,3 +26,48 @@ password = "changeme"
 #   audio_device = "Speakers (Realtek High Definition Audio)"
 #
 # audio_device = ""
+
+# ─────────────────────────────────────────────────────────────────────
+# Optional sections — all values shown are defaults.  Anything not set
+# here falls back to the corresponding CLI flag default.  CLI flags
+# always override config-file values.
+# ─────────────────────────────────────────────────────────────────────
+
+# [server]
+# host = "0.0.0.0"
+# port = 9090
+# static_dir = "./static"
+
+# [capture]
+# default_monitor = 0
+# # capture_backend = "scrap"   # also accepts "wgc" (stub) or "dxgi" (reserved)
+
+# [encoder]
+# # When auto_select = true the server probes which encoders work on
+# # this machine at startup and picks a sensible default.  When false
+# # the configured profile / CLI encoder is used as-is.
+# auto_select = true
+# default_profile = "office"
+
+# [encoder.profiles.gaming]
+# encoder      = "h264_amf"
+# codec        = "h264"        # h264 | hevc | av1 (auto-detected from encoder)
+# fps          = 60
+# quality      = 18
+# bitrate_kbps = 12000
+# slices       = 4
+# chroma       = "420"         # 420 | 444
+
+# [encoder.profiles.office]
+# encoder = "libx264"
+# fps     = 30
+# quality = 24
+
+# [audio]
+# default_device = "default"
+# sample_rate    = 48000
+# channels       = 2
+
+# [logging]
+# level = "info"               # trace | debug | info | warn | error
+# # file  = "wasm-remote.log"
