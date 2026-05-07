@@ -58,6 +58,8 @@ impl InputSimulator {
                 Self::set_keyboard_layout(klid);
             }
             ClientMessage::Ping { .. } => { /* handled by server */ }
+            ClientMessage::SelectEncoder { .. } => { /* handled by server */ }
+            ClientMessage::SelectProfile { .. } => { /* handled by server */ }
         }
     }
 

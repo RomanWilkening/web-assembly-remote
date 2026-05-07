@@ -2,6 +2,41 @@ use scrap::{Capturer, Display};
 use std::io::ErrorKind;
 use std::time::Duration;
 
+/// Capture-backend abstraction (Block D).
+///
+/// Concrete implementations are:
+///
+/// * [`ScreenCapture`] — the existing `scrap` (DXGI on Windows / X11 on
+///   Linux) backend.  Selected by `[capture].capture_backend = "scrap"`
+///   (the default) and fully wired into the server today.
+/// * [`WgcCapture`] — Windows.Graphics.Capture skeleton, currently a
+///   `unimplemented!` stub.  Selectable per config but `unimplemented!`
+///   until the real WGC integration lands in a follow-up.
+///
+/// The trait is intentionally minimal so a third-party can add a new
+/// backend without touching the encoder pipeline.  `next_frame` returns
+/// a borrowed slice into a backend-owned BGRA buffer to avoid copying
+/// the full ~33 MB (4K) framebuffer per frame.
+///
+/// Note: the trait deliberately does *not* require `Send` — `scrap`'s
+/// X11 backend holds an `Rc<xcb::Connection>` and so is `!Send` on
+/// Linux.  Callers that need to move the capture across threads do so
+/// today via `tokio::task::spawn_blocking`, which `move`s the value
+/// into a dedicated worker thread before any trait method is invoked.
+#[allow(dead_code)] // selectable via `[capture].capture_backend`; today the
+                    // server still uses `ScreenCapture` directly. Trait will
+                    // be the dispatch point once `WgcCapture` lands.
+pub trait Capture {
+    /// Width × height of the most recent capture, in pixels.
+    fn dimensions(&self) -> (u32, u32);
+
+    /// Acquire the next frame.  Returns a BGRA-packed slice of length
+    /// `width * height * 4`.  Blocking; backends may return
+    /// `ErrorKind::WouldBlock` when no new frame is yet available so
+    /// the caller can sleep / retry without spinning.
+    fn next_frame(&mut self) -> Result<&[u8], Box<dyn std::error::Error>>;
+}
+
 /// Wraps the platform screen-capture API (DXGI on Windows).
 ///
 /// ## Mouse cursor handling
@@ -126,6 +161,53 @@ impl ScreenCapture {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+}
+
+/// `Capture` impl wrapping the existing `scrap` capture path.
+impl Capture for ScreenCapture {
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn next_frame(&mut self) -> Result<&[u8], Box<dyn std::error::Error>> {
+        self.capture_frame()
+    }
+}
+
+/// Type alias for the soon-to-be-renamed `ScreenCapture`.  Block D's
+/// design doc names the scrap-backed implementation `ScrapCapture`;
+/// the type alias lets new code refer to it by the canonical name
+/// while keeping the public API stable for existing callers.
+#[allow(dead_code)]
+pub type ScrapCapture = ScreenCapture;
+
+/// Stub Windows.Graphics.Capture backend (Block D).
+///
+/// Selectable via `[capture].capture_backend = "wgc"` in `config.toml`,
+/// but every method currently panics with `unimplemented!`.  The actual
+/// integration (via the `windows` crate's
+/// `Windows::Graphics::Capture::Direct3D11CaptureFramePool`) is tracked
+/// as a follow-up — this skeleton lives here so the trait surface and
+/// the configuration plumbing are in place ahead of that work.
+#[allow(dead_code)]
+pub struct WgcCapture {
+    _private: (),
+}
+
+impl WgcCapture {
+    #[allow(dead_code)]
+    pub fn new(_monitor_index: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        Err("WGC capture backend is not implemented yet — \
+             use `[capture].capture_backend = \"scrap\"` (the default)".into())
+    }
+}
+
+impl Capture for WgcCapture {
+    fn dimensions(&self) -> (u32, u32) {
+        unimplemented!("WgcCapture::dimensions — pending Windows.Graphics.Capture integration")
+    }
+    fn next_frame(&mut self) -> Result<&[u8], Box<dyn std::error::Error>> {
+        unimplemented!("WgcCapture::next_frame — pending Windows.Graphics.Capture integration")
     }
 }
 
@@ -259,5 +341,37 @@ fn enumerate_monitors_fallback() -> Vec<protocol::MonitorInfo> {
             log::error!("Failed to enumerate displays: {e}");
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `WgcCapture::new` must fail cleanly (not panic) so an operator
+    /// who flips `[capture].capture_backend = "wgc"` ahead of the real
+    /// integration gets a clear error message rather than a crash.
+    #[test]
+    fn wgc_capture_constructor_returns_error() {
+        match WgcCapture::new(0) {
+            Ok(_) => panic!("WGC stub must report not-implemented, not succeed"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("WGC") && msg.contains("not implemented"),
+                    "unexpected error text: {msg}"
+                );
+            }
+        }
+    }
+
+    /// A trait object can be built from `ScreenCapture` — pins the
+    /// Block-D `Capture` trait surface so a future change can't silently
+    /// break the abstraction.
+    #[test]
+    fn capture_trait_object_compiles() {
+        // Compile-time only: we can't actually open a capturer in CI
+        // (no display), so this just checks dyn-dispatch is available.
+        fn _accept(_: &mut dyn Capture) {}
     }
 }

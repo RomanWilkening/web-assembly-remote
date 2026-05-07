@@ -16,11 +16,16 @@ use tower_http::services::ServeDir;
 
 use crate::auth::{self, AuthState};
 use crate::capture::{self, ScreenCapture};
-use crate::config::AuthConfig;
+use crate::config::{AppConfig, AuthConfig};
 use crate::cursor;
+use crate::diagnostics::{self, Diagnostics, EncoderResponse, HealthResponse};
 use crate::encoder::{Chroma, CodecKind, EncodedFrame, EncoderConfig, FfmpegEncoder};
+use crate::hw_probe::{self, EncoderCapability};
 use crate::input::InputSimulator;
 use crate::audio;
+use axum::Json;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 pub struct ServerConfig {
     pub addr: SocketAddr,
@@ -34,6 +39,9 @@ pub struct ServerConfig {
     pub static_dir: String,
     pub auth: AuthConfig,
     pub audio_device: Option<String>,
+    /// Full parsed `config.toml` for reading profile data and
+    /// `[encoder]` settings at runtime.
+    pub app_config: Arc<AppConfig>,
 }
 
 #[derive(Clone)]
@@ -47,6 +55,11 @@ struct AppState {
     bitrate_kbps: Option<u32>,
     auth: AuthState,
     audio_device: Option<String>,
+    app_config: Arc<AppConfig>,
+    /// Hardware-probed encoder list, computed once at server startup.
+    encoder_caps: Arc<Vec<EncoderCapability>>,
+    /// Live diagnostic counters (Block E).
+    diagnostics: Arc<Diagnostics>,
 }
 
 impl axum::extract::FromRef<AppState> for AuthState {
@@ -55,19 +68,99 @@ impl axum::extract::FromRef<AppState> for AuthState {
     }
 }
 
+/// Map [`crate::encoder::backends::HwVendor`] to the byte sent on the
+/// wire in `EncoderList`.  Stable; matches the documentation in
+/// [`protocol::EncoderInfo::hw_vendor`].
+fn hw_vendor_to_id(v: crate::encoder::backends::HwVendor) -> u8 {
+    use crate::encoder::backends::HwVendor::*;
+    match v {
+        Amd => 0,
+        Nvidia => 1,
+        Intel => 2,
+        Microsoft => 3,
+        Software => 4,
+        Other => 5,
+    }
+}
+
+// ── Diagnostic HTTP handlers (Block E) ─────────────────────────────
+
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    let snap = state.diagnostics.snapshot();
+    Json(HealthResponse {
+        ok: true,
+        uptime_secs: snap.uptime_secs,
+        active_sessions: snap.active_sessions,
+    })
+}
+
+async fn stats_handler(
+    State(state): State<AppState>,
+) -> Json<diagnostics::DiagnosticsSnapshot> {
+    Json(state.diagnostics.snapshot())
+}
+
+async fn encoders_handler(
+    State(state): State<AppState>,
+) -> Json<Vec<EncoderResponse>> {
+    let body: Vec<EncoderResponse> = state
+        .encoder_caps
+        .iter()
+        .map(EncoderResponse::from_capability)
+        .collect();
+    Json(body)
+}
+
+/// RAII guard that decrements `Diagnostics::active_sessions` when the
+/// websocket session ends (regardless of how — return, panic, or
+/// awaited future cancellation).
+struct SessionGuard {
+    diagnostics: Arc<Diagnostics>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.diagnostics
+            .active_sessions
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let auth_state = AuthState::new(&cfg.auth);
+
+    // Hardware probing — runs once at server startup.  Findings drive
+    // both the `MSG_ENCODER_LIST` payload sent to every client and (when
+    // `[encoder].auto_select = true`) the runtime default encoder
+    // selection.
+    let encoder_caps = tokio::task::spawn_blocking(hw_probe::probe)
+        .await
+        .unwrap_or_default();
+    log::info!(
+        "Hardware probe: {} known encoders, {} working",
+        encoder_caps.len(),
+        encoder_caps.iter().filter(|c| c.working).count(),
+    );
+    for c in &encoder_caps {
+        if c.working {
+            log::info!("  encoder available: {} ({:?}, vendor={:?})",
+                c.name, c.codec, c.hw_vendor);
+        }
+    }
 
     let state = AppState {
         fps: cfg.fps,
         quality: cfg.quality,
-        encoder: cfg.encoder,
+        encoder: cfg.encoder.clone(),
         codec: cfg.codec,
         chroma: cfg.chroma,
         slices: cfg.slices,
         bitrate_kbps: cfg.bitrate_kbps,
         auth: auth_state.clone(),
         audio_device: cfg.audio_device,
+        app_config: cfg.app_config,
+        encoder_caps: Arc::new(encoder_caps),
+        diagnostics: Diagnostics::new(cfg.encoder),
     };
 
     let app = Router::new()
@@ -76,6 +169,9 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/login", post(auth::login_handler))
         .route("/api/logout", post(auth::logout_handler))
         .route("/api/session", get(auth::session_check))
+        .route("/api/health", get(health_handler))
+        .route("/api/stats", get(stats_handler))
+        .route("/api/encoders", get(encoders_handler))
         .fallback_service(ServeDir::new(&cfg.static_dir))
         .layer(middleware::from_fn_with_state(
             auth_state,
@@ -116,6 +212,14 @@ async fn ws_upgrade(
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     log::info!("WebSocket client connected");
+
+    // Bump live-session counters; decrement automatically when this
+    // function returns (panic-safe via Drop).
+    state.diagnostics.active_sessions.fetch_add(1, Ordering::Relaxed);
+    state.diagnostics.total_sessions.fetch_add(1, Ordering::Relaxed);
+    let _session_guard = SessionGuard {
+        diagnostics: state.diagnostics.clone(),
+    };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -178,6 +282,69 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .is_err()
     {
         log::error!("Failed to send AudioDeviceList – client disconnected");
+        return;
+    }
+
+    // ── 0c. Send EncoderList (Block A) ─────────────────────────
+    let active_encoder_name = state.encoder.clone();
+    let encoder_list: Vec<protocol::EncoderInfo> = state
+        .encoder_caps
+        .iter()
+        .filter(|c| c.working)
+        .take(255)
+        .enumerate()
+        .map(|(i, c)| protocol::EncoderInfo {
+            index: i as u8,
+            name: c.name.clone(),
+            codec: c.codec.protocol_id(),
+            hw_vendor: hw_vendor_to_id(c.hw_vendor),
+            active: c.name == active_encoder_name,
+        })
+        .collect();
+    let encoder_list_msg = protocol::ServerMessage::EncoderList {
+        encoders: encoder_list,
+    };
+    log::info!(
+        "Sending EncoderList: {} working encoder(s)",
+        state.encoder_caps.iter().filter(|c| c.working).count(),
+    );
+    if ws_tx
+        .send(Message::Binary(encoder_list_msg.encode().into()))
+        .await
+        .is_err()
+    {
+        log::error!("Failed to send EncoderList – client disconnected");
+        return;
+    }
+
+    // ── 0d. Send ProfileList ───────────────────────────────────
+    let active_profile = state.app_config.encoder.default_profile.clone();
+    let profile_list: Vec<protocol::ProfileInfo> = state
+        .app_config
+        .encoder
+        .profiles
+        .keys()
+        .take(255)
+        .enumerate()
+        .map(|(i, name)| protocol::ProfileInfo {
+            index: i as u8,
+            name: name.clone(),
+            active: active_profile.as_deref() == Some(name.as_str()),
+        })
+        .collect();
+    let profile_list_msg = protocol::ServerMessage::ProfileList {
+        profiles: profile_list,
+    };
+    log::info!(
+        "Sending ProfileList: {} profile(s)",
+        state.app_config.encoder.profiles.len(),
+    );
+    if ws_tx
+        .send(Message::Binary(profile_list_msg.encode().into()))
+        .await
+        .is_err()
+    {
+        log::error!("Failed to send ProfileList – client disconnected");
         return;
     }
 
@@ -300,6 +467,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let cap_mon_y = mon_y;
     let cap_mon_w = screen_w as u32;
     let cap_mon_h = screen_h as u32;
+    let caps_for_loop = state.encoder_caps.clone();
+    let diag_for_loop = state.diagnostics.clone();
     let capture_handle = tokio::task::spawn_blocking(move || {
         if let Err(e) = capture_loop(
             CaptureLoopArgs {
@@ -316,6 +485,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 monitor_y: cap_mon_y,
                 monitor_w: cap_mon_w,
                 monitor_h: cap_mon_h,
+                encoder_caps: caps_for_loop,
+                diagnostics: diag_for_loop,
             },
         ) {
             log::error!("Capture loop error: {e}");
@@ -429,6 +600,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     // SelectAudio is handled in the WS receiver, not here.
                     protocol::ClientMessage::SelectAudio { .. } => {}
+                    // Encoder/profile switching at runtime requires a
+                    // full encoder-pipeline restart (the FFmpeg process
+                    // cannot reconfigure mid-stream for most backends).
+                    // The client should disconnect+reconnect after sending
+                    // the request, mirroring the SelectMonitor behaviour.
+                    // We log the request so operators can correlate with
+                    // any subsequent reconnect.
+                    protocol::ClientMessage::SelectEncoder { index } => {
+                        log::info!(
+                            "SelectEncoder({index}) – client should reconnect to apply"
+                        );
+                    }
+                    protocol::ClientMessage::SelectProfile { index } => {
+                        log::info!(
+                            "SelectProfile({index}) – client should reconnect to apply"
+                        );
+                    }
                     other => input_sim.handle(other),
                 }
             }
@@ -436,7 +624,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     // ── 5. WebSocket sender task (video frames + cursor info + audio + ping) ──
+    let diagnostics_for_sender = state.diagnostics.clone();
     let send_handle = tokio::spawn(async move {
+        let diagnostics = diagnostics_for_sender;
+        // Track frame count at the previous diag tick so we can compute
+        // a rolling FPS (frames sent in the last 5 s) for `/api/stats`.
+        let mut last_sent_frames: u64 = 0;
         // Periodic WebSocket pings keep SSL-inspecting proxies (e.g.
         // Netskope) from buffering data indefinitely.  The small control
         // frame forces the proxy to flush its write pipeline.
@@ -506,6 +699,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         sent_keys,
                         dropped_deltas
                     );
+                    // Round to nearest integer FPS instead of truncating
+                    // (a 3-fps sender would otherwise report 0 fps).
+                    let delta = sent_frames.saturating_sub(last_sent_frames);
+                    last_sent_frames = sent_frames;
+                    let fps_rounded = (delta + 2) / 5;
+                    diagnostics
+                        .current_fps
+                        .store(fps_rounded, Ordering::Relaxed);
                 }
                 Some(frame) = frame_rx.recv() => {
                     // ── IDR-aware drop policy ──────────────────────────
@@ -542,6 +743,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             // superseded by this IDR's decoder reset —
                             // safe to drop it all.
                             dropped_deltas += to_send.len() as u64;
+                            diagnostics
+                                .dropped_intermediate_deltas
+                                .fetch_add(to_send.len() as u64, Ordering::Relaxed);
                             to_send.clear();
                         }
                         to_send.push_back(next);
@@ -562,6 +766,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             return;
                         }
                         sent_frames += 1;
+                        diagnostics.frames_sent.fetch_add(1, Ordering::Relaxed);
+                        diagnostics
+                            .bytes_sent
+                            .fetch_add(payload_len as u64, Ordering::Relaxed);
                         if is_key {
                             sent_keys += 1;
                         }
@@ -649,6 +857,12 @@ struct CaptureLoopArgs<'a> {
     monitor_y: i32,
     monitor_w: u32,
     monitor_h: u32,
+    /// Hardware-probe results, used by the 3-strike fallback to pick
+    /// the next working encoder when the current one keeps stalling.
+    encoder_caps: Arc<Vec<EncoderCapability>>,
+    /// Counters bumped for every encoder restart / fallback so the
+    /// `/api/stats` endpoint reflects pipeline health.
+    diagnostics: Arc<Diagnostics>,
 }
 
 /// Main capture → encode loop. Runs on a dedicated OS thread.
@@ -656,11 +870,34 @@ struct CaptureLoopArgs<'a> {
 /// Cursor polling has been split off into its own task (see
 /// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
 /// to the encoder FPS.
+///
+/// Watchdog & fallback (Block B.2):
+///
+/// * After each frame send, the loop compares the time of the most
+///   recent byte read from FFmpeg (`EncoderStats::last_read_us`)
+///   against `max(1 s, 2 × frame_interval)`.  If FFmpeg has gone
+///   silent while we keep submitting frames, the encoder is
+///   restarted via `FfmpegEncoder::restart()` and
+///   `Diagnostics::encoder_restarts` is bumped.
+/// * Three consecutive restarts mark the current encoder unhealthy in
+///   the local `caps` vector and select the next working candidate
+///   (vendor-aware ordering is already applied at probe time).  This
+///   recovers from the well-known AMF reconfigure-stall failure mode
+///   without requiring operator intervention.
+///
+/// Resolution hot-reconfigure (Block B.3):
+///
+/// * Between two captured frames the loop checks
+///   `capture.dimensions()` against the running encoder config.  A
+///   change (monitor swap, DPI / refresh-rate change, hot-plug) calls
+///   `FfmpegEncoder::reconfigure()` with the new size — the next
+///   frame after the restart is naturally an IDR.
 fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::capture::Capture as _;
+
     let mut capture = ScreenCapture::new_for_display(args.monitor_index)
         .or_else(|_| ScreenCapture::new())?;
-    let w = capture.width();
-    let h = capture.height();
+    let (mut w, mut h) = capture.dimensions();
 
     log::info!(
         "Capture initialized: {}×{} @ {} fps (monitor {} at {}, {})",
@@ -676,7 +913,7 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
     // reports its own dimensions.
     let _ = (args.monitor_w, args.monitor_h);
 
-    let cfg = EncoderConfig {
+    let initial_cfg = EncoderConfig {
         width: w,
         height: h,
         fps: args.fps,
@@ -687,11 +924,31 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
         slices: args.slices,
         bitrate_kbps: args.bitrate_kbps,
     };
-    let mut encoder = FfmpegEncoder::new(cfg, args.frame_tx)?;
+    let mut encoder = FfmpegEncoder::new(initial_cfg, args.frame_tx.clone())?;
+
+    // Local mutable copy of the probe results — when the watchdog
+    // burns through three restarts on the same encoder we mark it
+    // unhealthy *here* so the fallback selection skips it next time.
+    let mut caps: Vec<EncoderCapability> = (*args.encoder_caps).clone();
 
     let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(args.fps));
+    // Watchdog: max(1 s, 2 × frame_interval) idle on FFmpeg stdout
+    // while we are still feeding frames triggers a restart.
+    let stall_threshold = std::cmp::max(
+        std::time::Duration::from_secs(1),
+        frame_interval * 2,
+    );
+    let stall_threshold_us = stall_threshold.as_micros() as u64;
+
     let boot = Instant::now();
     let mut frame_no: u64 = 0;
+    let mut consecutive_restarts: u32 = 0;
+    // Frames submitted since the last successful read from FFmpeg —
+    // we only treat a stall as "real" if we've actually been pushing
+    // data into stdin (otherwise an idle pipeline trivially matches
+    // the threshold).
+    let mut frames_since_progress: u64 = 0;
+    let mut last_seen_frames_out: u64 = 0;
 
     loop {
         let target = boot + frame_interval.mul_f64(frame_no as f64);
@@ -700,10 +957,125 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
             std::thread::sleep(target - now);
         }
 
+        // Read dimensions *before* `capture_frame()` so the encoder's
+        // mutable borrow of the BGRA buffer doesn't conflict with the
+        // immutable `dimensions()` call.  scrap reports the configured
+        // surface size, which only changes when the underlying display
+        // mode changes — sampling it pre-frame is safe.
+        let (cap_w, cap_h) = capture.dimensions();
         let bgra = capture.capture_frame()?;
-        encoder.send_frame(bgra)?;
 
+        // ── Resolution hot-reconfigure ────────────────────────
+        if (cap_w, cap_h) != (w, h) {
+            log::info!(
+                "Capture resolution changed: {}×{} → {}×{} – reconfiguring encoder",
+                w, h, cap_w, cap_h,
+            );
+            let mut new_cfg = encoder.config().clone();
+            new_cfg.width = cap_w;
+            new_cfg.height = cap_h;
+            if let Err(e) = encoder.reconfigure(new_cfg) {
+                log::error!("Encoder reconfigure failed: {e}");
+                return Err(e);
+            }
+            args.diagnostics
+                .encoder_restarts
+                .fetch_add(1, Ordering::Relaxed);
+            w = cap_w;
+            h = cap_h;
+            // The reconfigure already restarted FFmpeg so don't
+            // double-count below.
+            consecutive_restarts = 0;
+            frames_since_progress = 0;
+            last_seen_frames_out = encoder.stats().snapshot().frames_out;
+        }
+
+        encoder.send_frame(bgra)?;
         frame_no += 1;
+        frames_since_progress += 1;
+
+        // ── Watchdog ──────────────────────────────────────────
+        let snap = encoder.stats().snapshot();
+        if snap.frames_out > last_seen_frames_out {
+            // Forward progress observed since the last check.
+            consecutive_restarts = 0;
+            frames_since_progress = 0;
+            last_seen_frames_out = snap.frames_out;
+        } else {
+            let now_us = boot.elapsed().as_micros() as u64;
+            let action = crate::encoder::watchdog_decide(
+                frames_since_progress,
+                now_us,
+                snap.last_read_us,
+                stall_threshold_us,
+            );
+            if action == crate::encoder::WatchdogAction::Restart {
+                consecutive_restarts += 1;
+                args.diagnostics
+                    .encoder_restarts
+                    .fetch_add(1, Ordering::Relaxed);
+                let effective_idle = if snap.last_read_us == 0 {
+                    now_us
+                } else {
+                    now_us.saturating_sub(snap.last_read_us)
+                };
+                log::warn!(
+                    "Encoder stall detected ({} ms idle, threshold {} ms) – restart \
+                     #{}/3 of {}",
+                    effective_idle / 1_000,
+                    stall_threshold_us / 1_000,
+                    consecutive_restarts,
+                    encoder.config().encoder_name,
+                );
+
+                if consecutive_restarts >= 3 {
+                    // ── 3-strike fallback ─────────────────────
+                    let failed = encoder.config().encoder_name.clone();
+                    log::error!(
+                        "Encoder '{failed}' failed 3 consecutive restarts – marking \
+                         unhealthy and falling back",
+                    );
+                    if let Some(c) = caps.iter_mut().find(|c| c.name == failed) {
+                        c.working = false;
+                        c.reason = Some(format!(
+                            "auto-disabled after {consecutive_restarts} consecutive \
+                             watchdog restarts"
+                        ));
+                    }
+                    if let Some(next) = caps
+                        .iter()
+                        .find(|c| c.working && c.name != failed)
+                    {
+                        log::warn!(
+                            "Falling back from '{failed}' to '{}'",
+                            next.name,
+                        );
+                        let mut new_cfg = encoder.config().clone();
+                        new_cfg.encoder_name = next.name.clone();
+                        new_cfg.codec = next.codec;
+                        if let Err(e) = encoder.reconfigure(new_cfg) {
+                            log::error!("Fallback to '{}' failed: {e}", next.name);
+                            return Err(e);
+                        }
+                        *args.diagnostics.current_encoder.lock() = next.name.clone();
+                        consecutive_restarts = 0;
+                    } else {
+                        log::error!(
+                            "No fallback encoder available – aborting capture loop",
+                        );
+                        return Err(format!(
+                            "encoder '{failed}' unhealthy and no working fallback \
+                             encoder is available",
+                        ).into());
+                    }
+                } else if let Err(e) = encoder.restart() {
+                    log::error!("Encoder restart failed: {e}");
+                    return Err(e);
+                }
+                frames_since_progress = 0;
+                last_seen_frames_out = encoder.stats().snapshot().frames_out;
+            }
+        }
     }
 }
 
