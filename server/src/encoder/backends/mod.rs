@@ -33,6 +33,7 @@ pub enum HwVendor {
 }
 
 impl HwVendor {
+    #[allow(dead_code)] // exposed for log formatting / future API surfaces
     pub fn as_str(self) -> &'static str {
         match self {
             HwVendor::Amd => "amd",
@@ -77,6 +78,7 @@ impl BackendCaps {
 
 /// Result of looking up a backend by FFmpeg encoder name.
 pub struct Backend {
+    #[allow(dead_code)] // looked up by string already; kept for diagnostics & logging
     pub name: &'static str,
     pub caps: BackendCaps,
     pub build_args: fn(&mut Command, &EncoderConfig, &RcArgs),

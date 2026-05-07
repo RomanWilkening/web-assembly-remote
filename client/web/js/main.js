@@ -20,6 +20,8 @@ const MSG_MONITOR_LIST       = 0x04;
 const MSG_AUDIO_DATA         = 0x05;
 const MSG_AUDIO_DEVICE_LIST  = 0x06;
 const MSG_PONG               = 0x07;
+const MSG_ENCODER_LIST       = 0x08;
+const MSG_PROFILE_LIST       = 0x09;
 
 // ---------------------------------------------------------------------------
 // WASM loading with explicit fetch, timeout, and retry.
@@ -107,6 +109,8 @@ async function main() {
   const toggleLatency   = document.getElementById('toggle-latency');
   const audioSelect     = document.getElementById('audio-select');
   const layoutSelect    = document.getElementById('layout-select');
+  const encoderSelect   = document.getElementById('encoder-select');
+  const profileSelect   = document.getElementById('profile-select');
   const btnMute         = document.getElementById('btn-mute');
   const btnLogout       = document.getElementById('btn-logout');
   const remoteCursor    = document.getElementById('remote-cursor');
@@ -496,6 +500,28 @@ async function main() {
     }
   });
 
+  // ── 8d. Encoder selector (Block A) ──────────────────────────
+  // The server cannot reconfigure FFmpeg mid-stream for most backends,
+  // so a SelectEncoder request is announced via the wire (so it shows
+  // up in server logs / `/api/stats`) and then we trigger a clean
+  // reconnect to apply the change.  Mirrors the monitor-select pattern.
+  encoderSelect.addEventListener('change', () => {
+    const idx = parseInt(encoderSelect.value, 10);
+    if (isNaN(idx)) return;
+    send(wasm.encode_select_encoder(idx));
+    stopStream();
+    setTimeout(() => startStream(currentMonitorIndex), 100);
+  });
+
+  // ── 8e. Profile selector (Block C) ──────────────────────────
+  profileSelect.addEventListener('change', () => {
+    const idx = parseInt(profileSelect.value, 10);
+    if (isNaN(idx)) return;
+    send(wasm.encode_select_profile(idx));
+    stopStream();
+    setTimeout(() => startStream(currentMonitorIndex), 100);
+  });
+
   // ── 9. Monitor selector ──────────────────────────────────────
   monitorSelect.addEventListener('change', () => {
     const idx = parseInt(monitorSelect.value);
@@ -678,6 +704,51 @@ async function main() {
             opt.value  = idx.toString();
             opt.textContent = name;
             audioSelect.appendChild(opt);
+          }
+          break;
+        }
+
+        case MSG_ENCODER_LIST: {
+          // Mirror of the audio-select pattern (~30 LOC) — Block F.
+          const count = wasm.encoder_list_count(data);
+          console.log(`EncoderList: ${count} encoder(s)`);
+          encoderSelect.innerHTML = '';
+          for (let i = 0; i < count; i++) {
+            const idx    = wasm.encoder_index(data, i);
+            const name   = wasm.encoder_name(data, i);
+            const active = wasm.encoder_is_active(data, i);
+            const opt    = document.createElement('option');
+            opt.value    = idx.toString();
+            opt.textContent = name;
+            if (active) opt.selected = true;
+            encoderSelect.appendChild(opt);
+          }
+          break;
+        }
+
+        case MSG_PROFILE_LIST: {
+          const count = wasm.profile_list_count(data);
+          console.log(`ProfileList: ${count} profile(s)`);
+          profileSelect.innerHTML = '';
+          // Always include an explicit "(none)" option at the top so the
+          // operator can see when the server has zero profiles configured.
+          if (count === 0) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '(none)';
+            opt.disabled = true;
+            opt.selected = true;
+            profileSelect.appendChild(opt);
+          }
+          for (let i = 0; i < count; i++) {
+            const idx    = wasm.profile_index(data, i);
+            const name   = wasm.profile_name(data, i);
+            const active = wasm.profile_is_active(data, i);
+            const opt    = document.createElement('option');
+            opt.value    = idx.toString();
+            opt.textContent = name;
+            if (active) opt.selected = true;
+            profileSelect.appendChild(opt);
           }
           break;
         }

@@ -26,6 +26,7 @@ pub trait FrameSplitter: Send {
     /// Reset all internal state.  Called after an encoder restart so a
     /// fresh splitter does not see stale partial bytes from the previous
     /// FFmpeg process.
+    #[allow(dead_code)] // wired up in Block B.2 (encoder watchdog) and exercised by tests
     fn reset(&mut self);
 }
 

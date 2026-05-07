@@ -9,6 +9,9 @@ use std::path::Path;
 /// modification.
 ///
 /// CLI flags always override the values loaded here — see `main.rs`.
+#[allow(dead_code)] // Several sections (server, capture, logging) are scaffolding
+                    // for future blocks (D, E follow-ups) and intentionally
+                    // exposed as public API even before they're wired in.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AppConfig {
     /// Authentication settings.
@@ -57,7 +60,7 @@ pub struct AuthConfig {
 
 /// `[server]` — listening address and static-file root.
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct ServerSection {
+#[allow(dead_code)] pub struct ServerSection {
     /// Listen address (e.g. "0.0.0.0").  Falls back to CLI default when unset.
     #[serde(default)]
     pub host: Option<String>,
@@ -71,7 +74,7 @@ pub struct ServerSection {
 
 /// `[capture]` — screen-capture backend selection.
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct CaptureSection {
+#[allow(dead_code)] pub struct CaptureSection {
     /// Default monitor index to capture (0 = primary).  Client toolbar
     /// can switch at runtime.
     #[serde(default)]
@@ -85,6 +88,7 @@ pub struct CaptureSection {
 
 impl CaptureSection {
     /// Parsed backend kind.  Unknown values fall back to `Scrap`.
+    #[allow(dead_code)] // wired by Block D capture trait integration
     pub fn backend_kind(&self) -> CaptureBackendKind {
         match self.capture_backend.as_deref().unwrap_or("scrap") {
             "wgc" | "WGC" => CaptureBackendKind::Wgc,
@@ -96,7 +100,7 @@ impl CaptureSection {
 
 /// Capture-backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureBackendKind {
+#[allow(dead_code)] pub enum CaptureBackendKind {
     /// `scrap` crate — DXGI Desktop Duplication, current default.
     Scrap,
     /// Windows.Graphics.Capture (stub for now).
@@ -108,6 +112,7 @@ pub enum CaptureBackendKind {
 /// `[encoder]` — default profile + named encoder profiles.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+#[allow(dead_code)]
 pub struct EncoderSection {
     /// Name of the profile to use when the operator doesn't override
     /// at the CLI.  Must match a key under `[encoder.profiles.*]`.
@@ -164,7 +169,7 @@ pub struct EncoderProfile {
 
 /// `[audio]` — audio capture defaults.
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct AudioSection {
+#[allow(dead_code)] pub struct AudioSection {
     /// Default audio device (overrides legacy top-level `audio_device`
     /// when *both* are set the top-level wins for backward compat).
     #[serde(default)]
@@ -180,7 +185,7 @@ pub struct AudioSection {
 
 /// `[logging]` — logging configuration.
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct LoggingSection {
+#[allow(dead_code)] pub struct LoggingSection {
     /// Log level filter (`"trace"`, `"debug"`, `"info"`, `"warn"`,
     /// `"error"`).  Falls back to the `RUST_LOG` env var when unset.
     #[serde(default)]

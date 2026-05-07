@@ -115,6 +115,7 @@ impl EncodedFrame {
 /// Concurrently writeable from the encoder threads and readable from
 /// any other thread (used by the future watchdog and the `/api/stats`
 /// HTTP endpoint).
+#[allow(dead_code)] // `last_read_us` is consumed by the future watchdog (Block B.2).
 #[derive(Debug, Default)]
 pub struct EncoderStats {
     pub bytes_read: AtomicU64,
@@ -136,6 +137,7 @@ impl EncoderStats {
     }
 }
 
+#[allow(dead_code)] // last_read_us is for the watchdog stall-detector (Block B.2)
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderStatsSnapshot {
     pub bytes_read: u64,
@@ -151,6 +153,7 @@ pub struct FfmpegEncoder {
     process: Child,
     writer_tx: std_mpsc::SyncSender<Option<Vec<u8>>>,
     writer_scratch: Vec<u8>,
+    #[allow(dead_code)] // exposed via stats() for the future watchdog (Block B.2).
     stats: Arc<EncoderStats>,
 }
 
@@ -339,6 +342,7 @@ impl FfmpegEncoder {
     }
 
     /// Live diagnostic counters; safe to call from any thread.
+    #[allow(dead_code)] // wired into the watchdog in Block B.2
     pub fn stats(&self) -> Arc<EncoderStats> {
         Arc::clone(&self.stats)
     }

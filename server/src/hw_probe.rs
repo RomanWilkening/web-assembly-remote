@@ -149,6 +149,7 @@ pub fn probe() -> Vec<EncoderCapability> {
 /// driver) is downgraded to `working = false`.
 ///
 /// This is **opt-in** because each probe costs 100–500 ms.
+#[allow(dead_code)] // exposed as an opt-in helper; not invoked by default
 pub fn probe_with_encode(timeout: Duration) -> Vec<EncoderCapability> {
     probe()
         .into_iter()
@@ -238,6 +239,9 @@ fn try_one_frame(encoder: &str, timeout: Duration) -> Result<(), String> {
 ///
 /// Falls back to the first `working` entry when no priority match is
 /// found, or `None` when nothing works at all.
+#[allow(dead_code)] // exposed for future use by `[encoder].auto_select = true`
+                    // path; current default is whatever the operator passes
+                    // via --encoder / profile.
 pub fn select_default<'a>(
     caps: &'a [EncoderCapability],
     vendors_present: &[HwVendor],
@@ -290,11 +294,14 @@ pub fn select_default<'a>(
 /// On Windows the implementation is in [`dxgi`], which is feature-gated
 /// to avoid pulling the `windows` crate into the build for callers that
 /// don't need it.
+#[allow(dead_code)] // exposed for the Windows hot path / future
+                    // `[encoder].auto_select = true` integration.
 #[cfg(not(windows))]
 pub fn dxgi_vendors() -> Vec<HwVendor> {
     Vec::new()
 }
 
+#[allow(dead_code)]
 #[cfg(windows)]
 pub fn dxgi_vendors() -> Vec<HwVendor> {
     // The Windows-only implementation lives behind a `cfg(windows)`

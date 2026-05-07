@@ -18,10 +18,13 @@ use crate::auth::{self, AuthState};
 use crate::capture::{self, ScreenCapture};
 use crate::config::{AppConfig, AuthConfig};
 use crate::cursor;
+use crate::diagnostics::{self, Diagnostics, EncoderResponse, HealthResponse};
 use crate::encoder::{Chroma, CodecKind, EncodedFrame, EncoderConfig, FfmpegEncoder};
 use crate::hw_probe::{self, EncoderCapability};
 use crate::input::InputSimulator;
 use crate::audio;
+use axum::Json;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub struct ServerConfig {
@@ -55,6 +58,8 @@ struct AppState {
     app_config: Arc<AppConfig>,
     /// Hardware-probed encoder list, computed once at server startup.
     encoder_caps: Arc<Vec<EncoderCapability>>,
+    /// Live diagnostic counters (Block E).
+    diagnostics: Arc<Diagnostics>,
 }
 
 impl axum::extract::FromRef<AppState> for AuthState {
@@ -75,6 +80,49 @@ fn hw_vendor_to_id(v: crate::encoder::backends::HwVendor) -> u8 {
         Microsoft => 3,
         Software => 4,
         Other => 5,
+    }
+}
+
+// ── Diagnostic HTTP handlers (Block E) ─────────────────────────────
+
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    let snap = state.diagnostics.snapshot();
+    Json(HealthResponse {
+        ok: true,
+        uptime_secs: snap.uptime_secs,
+        active_sessions: snap.active_sessions,
+    })
+}
+
+async fn stats_handler(
+    State(state): State<AppState>,
+) -> Json<diagnostics::DiagnosticsSnapshot> {
+    Json(state.diagnostics.snapshot())
+}
+
+async fn encoders_handler(
+    State(state): State<AppState>,
+) -> Json<Vec<EncoderResponse>> {
+    let body: Vec<EncoderResponse> = state
+        .encoder_caps
+        .iter()
+        .map(EncoderResponse::from_capability)
+        .collect();
+    Json(body)
+}
+
+/// RAII guard that decrements `Diagnostics::active_sessions` when the
+/// websocket session ends (regardless of how — return, panic, or
+/// awaited future cancellation).
+struct SessionGuard {
+    diagnostics: Arc<Diagnostics>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.diagnostics
+            .active_sessions
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -103,7 +151,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         fps: cfg.fps,
         quality: cfg.quality,
-        encoder: cfg.encoder,
+        encoder: cfg.encoder.clone(),
         codec: cfg.codec,
         chroma: cfg.chroma,
         slices: cfg.slices,
@@ -112,6 +160,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         audio_device: cfg.audio_device,
         app_config: cfg.app_config,
         encoder_caps: Arc::new(encoder_caps),
+        diagnostics: Diagnostics::new(cfg.encoder),
     };
 
     let app = Router::new()
@@ -120,6 +169,9 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/login", post(auth::login_handler))
         .route("/api/logout", post(auth::logout_handler))
         .route("/api/session", get(auth::session_check))
+        .route("/api/health", get(health_handler))
+        .route("/api/stats", get(stats_handler))
+        .route("/api/encoders", get(encoders_handler))
         .fallback_service(ServeDir::new(&cfg.static_dir))
         .layer(middleware::from_fn_with_state(
             auth_state,
@@ -160,6 +212,14 @@ async fn ws_upgrade(
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     log::info!("WebSocket client connected");
+
+    // Bump live-session counters; decrement automatically when this
+    // function returns (panic-safe via Drop).
+    state.diagnostics.active_sessions.fetch_add(1, Ordering::Relaxed);
+    state.diagnostics.total_sessions.fetch_add(1, Ordering::Relaxed);
+    let _session_guard = SessionGuard {
+        diagnostics: state.diagnostics.clone(),
+    };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -560,7 +620,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     // ── 5. WebSocket sender task (video frames + cursor info + audio + ping) ──
+    let diagnostics_for_sender = state.diagnostics.clone();
     let send_handle = tokio::spawn(async move {
+        let diagnostics = diagnostics_for_sender;
+        // Track frame count at the previous diag tick so we can compute
+        // a rolling FPS (frames sent in the last 5 s) for `/api/stats`.
+        let mut last_sent_frames: u64 = 0;
         // Periodic WebSocket pings keep SSL-inspecting proxies (e.g.
         // Netskope) from buffering data indefinitely.  The small control
         // frame forces the proxy to flush its write pipeline.
@@ -630,6 +695,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         sent_keys,
                         dropped_deltas
                     );
+                    let delta = sent_frames.saturating_sub(last_sent_frames);
+                    last_sent_frames = sent_frames;
+                    diagnostics
+                        .current_fps
+                        .store(delta / 5, Ordering::Relaxed);
                 }
                 Some(frame) = frame_rx.recv() => {
                     // ── IDR-aware drop policy ──────────────────────────
@@ -666,6 +736,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             // superseded by this IDR's decoder reset —
                             // safe to drop it all.
                             dropped_deltas += to_send.len() as u64;
+                            diagnostics
+                                .dropped_intermediate_deltas
+                                .fetch_add(to_send.len() as u64, Ordering::Relaxed);
                             to_send.clear();
                         }
                         to_send.push_back(next);
@@ -686,6 +759,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             return;
                         }
                         sent_frames += 1;
+                        diagnostics.frames_sent.fetch_add(1, Ordering::Relaxed);
+                        diagnostics
+                            .bytes_sent
+                            .fetch_add(payload_len as u64, Ordering::Relaxed);
                         if is_key {
                             sent_keys += 1;
                         }

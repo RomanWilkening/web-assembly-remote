@@ -3,6 +3,7 @@ mod auth;
 mod capture;
 mod config;
 mod cursor;
+mod diagnostics;
 mod encoder;
 mod hw_probe;
 mod input;
