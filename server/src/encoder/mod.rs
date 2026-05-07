@@ -113,9 +113,8 @@ impl EncodedFrame {
 /// Live diagnostic counters published by an [`FfmpegEncoder`] instance.
 ///
 /// Concurrently writeable from the encoder threads and readable from
-/// any other thread (used by the future watchdog and the `/api/stats`
-/// HTTP endpoint).
-#[allow(dead_code)] // `last_read_us` is consumed by the future watchdog (Block B.2).
+/// any other thread (used by the watchdog and the `/api/stats` HTTP
+/// endpoint).
 #[derive(Debug, Default)]
 pub struct EncoderStats {
     pub bytes_read: AtomicU64,
@@ -137,7 +136,6 @@ impl EncoderStats {
     }
 }
 
-#[allow(dead_code)] // last_read_us is for the watchdog stall-detector (Block B.2)
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderStatsSnapshot {
     pub bytes_read: u64,
@@ -146,15 +144,57 @@ pub struct EncoderStatsSnapshot {
     pub last_read_us: u64,
 }
 
+/// Trait facade for video encoders.
+///
+/// `FfmpegEncoder` is the only impl today, but the trait keeps the
+/// surface that the capture loop / watchdog depend on small and
+/// testable, and lets a future direct-AMF / direct-NVENC backend slot
+/// in without touching `server.rs`.
+#[allow(dead_code)] // public extension point — no dyn caller in-tree yet
+pub trait EncoderBackend: Send {
+    /// Submit a raw BGRA frame.
+    fn send_frame(&mut self, bgra: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Force the encoder to emit an IDR / keyframe on the next frame.
+    /// Implemented as a process restart for `FfmpegEncoder` because
+    /// FFmpeg has no in-band keyframe-request channel that works for
+    /// every backend (AMF in particular ignores `force_key_frames` once
+    /// the GOP rhythm is locked in).
+    fn request_keyframe(&mut self) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Replace the running encoder with one configured for `cfg`.
+    /// Used for resolution hot-reconfigure (monitor swap, DPI change)
+    /// and for the watchdog's restart path.
+    fn reconfigure(&mut self, cfg: EncoderConfig) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Shared diagnostic counters; safe to read from any thread.
+    fn stats(&self) -> Arc<EncoderStats>;
+
+    /// The currently-active configuration (so the caller can inspect
+    /// `width` / `height` to detect a resolution change).
+    fn config(&self) -> &EncoderConfig;
+
+    /// Cooperative shutdown.  After this returns no more frames will
+    /// be produced.  Idempotent.
+    fn shutdown(&mut self);
+}
+
 /// Manages an FFmpeg subprocess that accepts raw BGRA frames on stdin
 /// and produces a codec-specific Annex-B / OBU byte-stream on stdout.
 pub struct FfmpegEncoder {
-    #[allow(dead_code)]
-    process: Child,
+    process: Option<Child>,
     writer_tx: std_mpsc::SyncSender<Option<Vec<u8>>>,
     writer_scratch: Vec<u8>,
-    #[allow(dead_code)] // exposed via stats() for the future watchdog (Block B.2).
+    /// Live diagnostic counters.  Wrapped in an outer `Arc` so the
+    /// reader thread of every (re)spawned process can publish into the
+    /// **same** counters — a watchdog stall threshold is meaningful
+    /// only across restarts.
     stats: Arc<EncoderStats>,
+    /// The currently-running config; updated by `reconfigure()`.
+    cfg: EncoderConfig,
+    /// Kept so `restart()` / `reconfigure()` can spawn a new process
+    /// without the caller having to re-plumb the channel.
+    frame_tx: mpsc::Sender<EncodedFrame>,
 }
 
 impl FfmpegEncoder {
@@ -240,6 +280,17 @@ impl FfmpegEncoder {
         cfg: EncoderConfig,
         frame_tx: mpsc::Sender<EncodedFrame>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stats = Arc::new(EncoderStats::default());
+        Self::spawn_internal(cfg, frame_tx, stats)
+    }
+
+    /// Internal helper: spawn FFmpeg, plumbing **existing** stats so
+    /// counters survive restarts (the watchdog needs that).
+    fn spawn_internal(
+        cfg: EncoderConfig,
+        frame_tx: mpsc::Sender<EncodedFrame>,
+        stats: Arc<EncoderStats>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Pre-flight validation for an actionable error message.
         validate::validate(&cfg).map_err(|e| {
             log::error!("Encoder pre-flight validation failed: {e}");
@@ -287,9 +338,9 @@ impl FfmpegEncoder {
             })?;
 
         // Background reader thread.
-        let stats = Arc::new(EncoderStats::default());
         let reader_stats = Arc::clone(&stats);
         let codec = cfg.codec;
+        let frame_tx_for_reader = frame_tx.clone();
         std::thread::Builder::new()
             .name("encoder-reader".into())
             .spawn(move || {
@@ -298,7 +349,7 @@ impl FfmpegEncoder {
                     CodecKind::Hevc => Box::new(HevcSplitter::new()),
                     CodecKind::Av1 => Box::new(Av1Splitter::new()),
                 };
-                encoder_reader_loop(stdout, splitter, frame_tx, reader_stats);
+                encoder_reader_loop(stdout, splitter, frame_tx_for_reader, reader_stats);
             })?;
 
         // Background writer thread.
@@ -310,10 +361,12 @@ impl FfmpegEncoder {
             })?;
 
         Ok(Self {
-            process,
+            process: Some(process),
             writer_tx,
             writer_scratch: Vec::new(),
             stats,
+            cfg,
+            frame_tx,
         })
     }
 
@@ -342,15 +395,118 @@ impl FfmpegEncoder {
     }
 
     /// Live diagnostic counters; safe to call from any thread.
-    #[allow(dead_code)] // wired into the watchdog in Block B.2
     pub fn stats(&self) -> Arc<EncoderStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Currently-active encoder configuration.
+    pub fn config(&self) -> &EncoderConfig {
+        &self.cfg
+    }
+
+    /// Tear down the writer / process.  Called by `Drop` and by
+    /// `restart()` / `reconfigure()`.  Idempotent: safe to call on a
+    /// half-shut-down encoder.
+    pub fn shutdown(&mut self) {
+        // Tell the writer thread to flush + exit so FFmpeg sees EOF on
+        // stdin and shuts down its pipeline cleanly.
+        let _ = self.writer_tx.send(None);
+
+        // Don't wait forever — give FFmpeg a brief grace period; if it
+        // hasn't exited (e.g. AMF reconfigure-stall) kill it so the
+        // restart path isn't blocked.
+        if let Some(mut child) = self.process.take() {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() >= deadline => {
+                        log::warn!("FFmpeg did not exit within 750 ms – killing");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                    Err(e) => {
+                        log::warn!("FFmpeg wait error: {e}; killing");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replace the running FFmpeg process, preserving the live stats
+    /// counters (so the watchdog's stall threshold continues to work
+    /// across restarts) and the frame channel (so the WebSocket
+    /// sender doesn't have to re-subscribe).  The first frame after a
+    /// restart is naturally an IDR.
+    pub fn restart(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        log::info!("Restarting FFmpeg encoder ({})…", self.cfg.encoder_name);
+        self.shutdown();
+        let cfg = self.cfg.clone();
+        let frame_tx = self.frame_tx.clone();
+        let stats = Arc::clone(&self.stats);
+        // Reset the per-process portion of the stats so the watchdog
+        // doesn't immediately trip on a stale `last_read_us`.
+        stats.last_read_us.store(0, Ordering::Relaxed);
+        let mut fresh = Self::spawn_internal(cfg, frame_tx, stats)?;
+        // Steal the freshly-spawned process / writer into self.  We
+        // can't simply assign `*self = fresh` because that would
+        // invoke `Drop` on `self` (killing the just-spawned child),
+        // and we can't move fields out of `fresh` because it has
+        // `Drop`.  So we swap in place and let the temporary `fresh`
+        // (now holding the already-shut-down state) drop harmlessly.
+        std::mem::swap(&mut self.process, &mut fresh.process);
+        std::mem::swap(&mut self.writer_tx, &mut fresh.writer_tx);
+        std::mem::swap(&mut self.writer_scratch, &mut fresh.writer_scratch);
+        Ok(())
+    }
+
+    /// Replace the running encoder with one configured for `cfg`.
+    pub fn reconfigure(&mut self, cfg: EncoderConfig) -> Result<(), Box<dyn std::error::Error>> {
+        log::info!(
+            "Reconfiguring encoder: {}x{} @ {} fps -> {}x{} @ {} fps",
+            self.cfg.width, self.cfg.height, self.cfg.fps,
+            cfg.width, cfg.height, cfg.fps,
+        );
+        self.cfg = cfg;
+        self.restart()
+    }
+}
+
+impl EncoderBackend for FfmpegEncoder {
+    fn send_frame(&mut self, bgra: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        FfmpegEncoder::send_frame(self, bgra)
+    }
+    fn request_keyframe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // FFmpeg's `force_key_frames` only fires on the GOP boundary.
+        // For an unconditional, "right now" IDR we restart — the next
+        // frame after spawn is always an IDR.  This is the same
+        // mechanism the watchdog uses, so the post-restart bitstream
+        // is guaranteed decodable by the client even if the prior
+        // backend got into a stuck state.
+        FfmpegEncoder::restart(self)
+    }
+    fn reconfigure(&mut self, cfg: EncoderConfig) -> Result<(), Box<dyn std::error::Error>> {
+        FfmpegEncoder::reconfigure(self, cfg)
+    }
+    fn stats(&self) -> Arc<EncoderStats> {
+        FfmpegEncoder::stats(self)
+    }
+    fn config(&self) -> &EncoderConfig {
+        FfmpegEncoder::config(self)
+    }
+    fn shutdown(&mut self) {
+        FfmpegEncoder::shutdown(self)
     }
 }
 
 impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
-        let _ = self.writer_tx.send(None);
+        self.shutdown();
     }
 }
 
@@ -488,7 +644,58 @@ fn encoder_reader_loop(
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────
+// ── Watchdog stall detection ───────────────────────────────────────
+
+/// What the watchdog should do *next*, given the current encoder
+/// stats and how many frames have been submitted since the last
+/// observed forward progress.  Pure function so it can be unit-tested
+/// without spawning FFmpeg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogAction {
+    /// All clear — keep going.
+    Continue,
+    /// FFmpeg stopped emitting bytes despite frames being submitted.
+    /// Caller should `restart()` the encoder.
+    Restart,
+}
+
+/// Decide whether the encoder pipeline is stalled.
+///
+/// * `frames_submitted_since_progress` — how many frames the capture
+///   loop has pushed into the writer since `frames_out` last
+///   advanced.
+/// * `now_us` / `last_read_us` — server-clock microseconds.  If
+///   `last_read_us == 0` the encoder never produced any output, in
+///   which case `now_us` itself is treated as the idle duration so a
+///   totally dead encoder still trips the watchdog.
+/// * `stall_threshold_us` — caller-supplied threshold, typically
+///   `max(1 s, 2 × frame_interval).as_micros()`.
+pub fn watchdog_decide(
+    frames_submitted_since_progress: u64,
+    now_us: u64,
+    last_read_us: u64,
+    stall_threshold_us: u64,
+) -> WatchdogAction {
+    // Need at least two frames in flight before we trust the idle
+    // measurement — submitting a single frame and immediately
+    // checking is racy because the reader thread may not have
+    // consumed it yet.
+    if frames_submitted_since_progress < 2 {
+        return WatchdogAction::Continue;
+    }
+    let idle_us = if last_read_us == 0 {
+        now_us
+    } else {
+        now_us.saturating_sub(last_read_us)
+    };
+    if idle_us > stall_threshold_us {
+        WatchdogAction::Restart
+    } else {
+        WatchdogAction::Continue
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -621,5 +828,65 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-rc", "cqp"]));
         assert!(args.windows(2).any(|w| w == ["-qp_i", "20"]));
         assert!(args.windows(2).any(|w| w == ["-qp_p", "20"]));
+    }
+
+    // ── Watchdog ──────────────────────────────────────────────────
+
+    #[test]
+    fn watchdog_does_not_trip_with_only_one_frame_in_flight() {
+        // Submitting a single frame and immediately checking is racy
+        // (the reader thread may not have consumed it yet) — the
+        // watchdog must wait for at least two frames before tripping.
+        let action = watchdog_decide(
+            /* frames_submitted_since_progress = */ 1,
+            /* now_us                          = */ 5_000_000,
+            /* last_read_us                    = */ 0,
+            /* stall_threshold_us              = */ 1_000_000,
+        );
+        assert_eq!(action, WatchdogAction::Continue);
+    }
+
+    #[test]
+    fn watchdog_continues_when_idle_below_threshold() {
+        let action = watchdog_decide(10, 1_500_000, 1_000_000, 1_000_000);
+        // idle = 500 ms, threshold = 1 s → continue
+        assert_eq!(action, WatchdogAction::Continue);
+    }
+
+    #[test]
+    fn watchdog_restarts_when_idle_exceeds_threshold() {
+        let action = watchdog_decide(10, 3_500_000, 1_000_000, 1_000_000);
+        // idle = 2.5 s, threshold = 1 s → restart
+        assert_eq!(action, WatchdogAction::Restart);
+    }
+
+    #[test]
+    fn watchdog_restarts_when_encoder_never_produced_output() {
+        // last_read_us == 0 (never produced bytes) → idle counted from boot.
+        let action = watchdog_decide(10, 2_000_000, 0, 1_000_000);
+        assert_eq!(action, WatchdogAction::Restart);
+    }
+
+    #[test]
+    fn watchdog_does_not_underflow_on_clock_skew() {
+        // last_read_us > now_us would be a clock anomaly; saturating
+        // sub means we don't wrap, and the watchdog must keep going.
+        let action = watchdog_decide(10, 500_000, 1_000_000, 1_000_000);
+        assert_eq!(action, WatchdogAction::Continue);
+    }
+
+    // ── EncoderBackend trait surface ──────────────────────────────
+
+    #[test]
+    fn ffmpeg_encoder_implements_encoder_backend_trait() {
+        // Compile-time check: the dyn-dispatch site exists.  This
+        // pins the trait surface so a future change can't silently
+        // break the abstraction the capture pipeline relies on.
+        fn _accepts_dyn(_: &mut dyn EncoderBackend) {}
+        // Type-level only — guarantees `FfmpegEncoder: EncoderBackend`
+        // without requiring an actual FFmpeg subprocess.
+        fn _assert_impl<T: EncoderBackend>() {}
+        _assert_impl::<FfmpegEncoder>();
+        let _ = _accepts_dyn;
     }
 }

@@ -467,6 +467,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let cap_mon_y = mon_y;
     let cap_mon_w = screen_w as u32;
     let cap_mon_h = screen_h as u32;
+    let caps_for_loop = state.encoder_caps.clone();
+    let diag_for_loop = state.diagnostics.clone();
     let capture_handle = tokio::task::spawn_blocking(move || {
         if let Err(e) = capture_loop(
             CaptureLoopArgs {
@@ -483,6 +485,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 monitor_y: cap_mon_y,
                 monitor_w: cap_mon_w,
                 monitor_h: cap_mon_h,
+                encoder_caps: caps_for_loop,
+                diagnostics: diag_for_loop,
             },
         ) {
             log::error!("Capture loop error: {e}");
@@ -853,6 +857,12 @@ struct CaptureLoopArgs<'a> {
     monitor_y: i32,
     monitor_w: u32,
     monitor_h: u32,
+    /// Hardware-probe results, used by the 3-strike fallback to pick
+    /// the next working encoder when the current one keeps stalling.
+    encoder_caps: Arc<Vec<EncoderCapability>>,
+    /// Counters bumped for every encoder restart / fallback so the
+    /// `/api/stats` endpoint reflects pipeline health.
+    diagnostics: Arc<Diagnostics>,
 }
 
 /// Main capture → encode loop. Runs on a dedicated OS thread.
@@ -860,11 +870,34 @@ struct CaptureLoopArgs<'a> {
 /// Cursor polling has been split off into its own task (see
 /// `cursor_handle` in [`run`]) so cursor latency is no longer coupled
 /// to the encoder FPS.
+///
+/// Watchdog & fallback (Block B.2):
+///
+/// * After each frame send, the loop compares the time of the most
+///   recent byte read from FFmpeg (`EncoderStats::last_read_us`)
+///   against `max(1 s, 2 × frame_interval)`.  If FFmpeg has gone
+///   silent while we keep submitting frames, the encoder is
+///   restarted via `FfmpegEncoder::restart()` and
+///   `Diagnostics::encoder_restarts` is bumped.
+/// * Three consecutive restarts mark the current encoder unhealthy in
+///   the local `caps` vector and select the next working candidate
+///   (vendor-aware ordering is already applied at probe time).  This
+///   recovers from the well-known AMF reconfigure-stall failure mode
+///   without requiring operator intervention.
+///
+/// Resolution hot-reconfigure (Block B.3):
+///
+/// * Between two captured frames the loop checks
+///   `capture.dimensions()` against the running encoder config.  A
+///   change (monitor swap, DPI / refresh-rate change, hot-plug) calls
+///   `FfmpegEncoder::reconfigure()` with the new size — the next
+///   frame after the restart is naturally an IDR.
 fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::capture::Capture as _;
+
     let mut capture = ScreenCapture::new_for_display(args.monitor_index)
         .or_else(|_| ScreenCapture::new())?;
-    let w = capture.width();
-    let h = capture.height();
+    let (mut w, mut h) = capture.dimensions();
 
     log::info!(
         "Capture initialized: {}×{} @ {} fps (monitor {} at {}, {})",
@@ -880,7 +913,7 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
     // reports its own dimensions.
     let _ = (args.monitor_w, args.monitor_h);
 
-    let cfg = EncoderConfig {
+    let initial_cfg = EncoderConfig {
         width: w,
         height: h,
         fps: args.fps,
@@ -891,11 +924,31 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
         slices: args.slices,
         bitrate_kbps: args.bitrate_kbps,
     };
-    let mut encoder = FfmpegEncoder::new(cfg, args.frame_tx)?;
+    let mut encoder = FfmpegEncoder::new(initial_cfg, args.frame_tx.clone())?;
+
+    // Local mutable copy of the probe results — when the watchdog
+    // burns through three restarts on the same encoder we mark it
+    // unhealthy *here* so the fallback selection skips it next time.
+    let mut caps: Vec<EncoderCapability> = (*args.encoder_caps).clone();
 
     let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(args.fps));
+    // Watchdog: max(1 s, 2 × frame_interval) idle on FFmpeg stdout
+    // while we are still feeding frames triggers a restart.
+    let stall_threshold = std::cmp::max(
+        std::time::Duration::from_secs(1),
+        frame_interval * 2,
+    );
+    let stall_threshold_us = stall_threshold.as_micros() as u64;
+
     let boot = Instant::now();
     let mut frame_no: u64 = 0;
+    let mut consecutive_restarts: u32 = 0;
+    // Frames submitted since the last successful read from FFmpeg —
+    // we only treat a stall as "real" if we've actually been pushing
+    // data into stdin (otherwise an idle pipeline trivially matches
+    // the threshold).
+    let mut frames_since_progress: u64 = 0;
+    let mut last_seen_frames_out: u64 = 0;
 
     loop {
         let target = boot + frame_interval.mul_f64(frame_no as f64);
@@ -904,10 +957,125 @@ fn capture_loop(args: CaptureLoopArgs<'_>) -> Result<(), Box<dyn std::error::Err
             std::thread::sleep(target - now);
         }
 
+        // Read dimensions *before* `capture_frame()` so the encoder's
+        // mutable borrow of the BGRA buffer doesn't conflict with the
+        // immutable `dimensions()` call.  scrap reports the configured
+        // surface size, which only changes when the underlying display
+        // mode changes — sampling it pre-frame is safe.
+        let (cap_w, cap_h) = capture.dimensions();
         let bgra = capture.capture_frame()?;
-        encoder.send_frame(bgra)?;
 
+        // ── Resolution hot-reconfigure ────────────────────────
+        if (cap_w, cap_h) != (w, h) {
+            log::info!(
+                "Capture resolution changed: {}×{} → {}×{} – reconfiguring encoder",
+                w, h, cap_w, cap_h,
+            );
+            let mut new_cfg = encoder.config().clone();
+            new_cfg.width = cap_w;
+            new_cfg.height = cap_h;
+            if let Err(e) = encoder.reconfigure(new_cfg) {
+                log::error!("Encoder reconfigure failed: {e}");
+                return Err(e);
+            }
+            args.diagnostics
+                .encoder_restarts
+                .fetch_add(1, Ordering::Relaxed);
+            w = cap_w;
+            h = cap_h;
+            // The reconfigure already restarted FFmpeg so don't
+            // double-count below.
+            consecutive_restarts = 0;
+            frames_since_progress = 0;
+            last_seen_frames_out = encoder.stats().snapshot().frames_out;
+        }
+
+        encoder.send_frame(bgra)?;
         frame_no += 1;
+        frames_since_progress += 1;
+
+        // ── Watchdog ──────────────────────────────────────────
+        let snap = encoder.stats().snapshot();
+        if snap.frames_out > last_seen_frames_out {
+            // Forward progress observed since the last check.
+            consecutive_restarts = 0;
+            frames_since_progress = 0;
+            last_seen_frames_out = snap.frames_out;
+        } else {
+            let now_us = boot.elapsed().as_micros() as u64;
+            let action = crate::encoder::watchdog_decide(
+                frames_since_progress,
+                now_us,
+                snap.last_read_us,
+                stall_threshold_us,
+            );
+            if action == crate::encoder::WatchdogAction::Restart {
+                consecutive_restarts += 1;
+                args.diagnostics
+                    .encoder_restarts
+                    .fetch_add(1, Ordering::Relaxed);
+                let effective_idle = if snap.last_read_us == 0 {
+                    now_us
+                } else {
+                    now_us.saturating_sub(snap.last_read_us)
+                };
+                log::warn!(
+                    "Encoder stall detected ({} ms idle, threshold {} ms) – restart \
+                     #{}/3 of {}",
+                    effective_idle / 1_000,
+                    stall_threshold_us / 1_000,
+                    consecutive_restarts,
+                    encoder.config().encoder_name,
+                );
+
+                if consecutive_restarts >= 3 {
+                    // ── 3-strike fallback ─────────────────────
+                    let failed = encoder.config().encoder_name.clone();
+                    log::error!(
+                        "Encoder '{failed}' failed 3 consecutive restarts – marking \
+                         unhealthy and falling back",
+                    );
+                    if let Some(c) = caps.iter_mut().find(|c| c.name == failed) {
+                        c.working = false;
+                        c.reason = Some(format!(
+                            "auto-disabled after {consecutive_restarts} consecutive \
+                             watchdog restarts"
+                        ));
+                    }
+                    if let Some(next) = caps
+                        .iter()
+                        .find(|c| c.working && c.name != failed)
+                    {
+                        log::warn!(
+                            "Falling back from '{failed}' to '{}'",
+                            next.name,
+                        );
+                        let mut new_cfg = encoder.config().clone();
+                        new_cfg.encoder_name = next.name.clone();
+                        new_cfg.codec = next.codec;
+                        if let Err(e) = encoder.reconfigure(new_cfg) {
+                            log::error!("Fallback to '{}' failed: {e}", next.name);
+                            return Err(e);
+                        }
+                        *args.diagnostics.current_encoder.lock() = next.name.clone();
+                        consecutive_restarts = 0;
+                    } else {
+                        log::error!(
+                            "No fallback encoder available – aborting capture loop",
+                        );
+                        return Err(format!(
+                            "encoder '{failed}' unhealthy and no working fallback \
+                             encoder is available",
+                        ).into());
+                    }
+                } else if let Err(e) = encoder.restart() {
+                    log::error!("Encoder restart failed: {e}");
+                    return Err(e);
+                }
+                frames_since_progress = 0;
+                last_seen_frames_out = encoder.stats().snapshot().frames_out;
+            }
+        }
     }
 }
 
