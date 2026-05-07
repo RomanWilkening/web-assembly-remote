@@ -7,15 +7,33 @@
  * shader then samples to RGBA.  Falls back to Canvas2D `drawImage` on
  * browsers where WebGL2 isn't available or texImage2D rejects the frame.
  *
- * Frames are coalesced through `requestAnimationFrame` so we paint at
- * most once per display refresh; rAF is only armed while a frame is
- * actually pending so the main thread stays idle when the remote
- * desktop has nothing to send.
+ * Two scheduling modes are supported:
+ *
+ *   * `lowLatency: true` (default) — paint immediately on
+ *     `drawFrame()`.  The GPU command is issued straight away so the
+ *     compositor can present at the very next display refresh.  When
+ *     two decoded frames arrive within the same vsync interval the
+ *     second simply overdraws the first; the wasted GPU draw call is
+ *     vanishingly cheap for our single-quad shader and the user only
+ *     ever sees the latest pixels anyway.
+ *
+ *   * `lowLatency: false` — coalesce through `requestAnimationFrame`
+ *     so we paint at most once per display refresh.  Slightly less CPU
+ *     when running well above the display refresh rate but trades up
+ *     to one vsync of extra latency.  Kept as an opt-out for power
+ *     profiling.
+ *
+ * In both modes only the latest pending frame is kept; older
+ * undelivered frames are `close()`d so the GPU surface pool isn't
+ * leaked.
  */
 
 export class Renderer {
-  /** @param {HTMLCanvasElement} canvas */
-  constructor(canvas) {
+  /**
+   * @param {HTMLCanvasElement} canvas
+   * @param {{lowLatency?: boolean}} [opts]
+   */
+  constructor(canvas, opts = {}) {
     /** @private */
     this._canvas = canvas;
     /** @private @type {VideoFrame|null} */
@@ -24,10 +42,45 @@ export class Renderer {
     this._animId = 0;
     /** @private */
     this._running = false;
+    /** @private */
+    this._lowLatency = opts.lowLatency !== false;
+
+    // ── Diagnostic counters ─────────────────────────────────────
+    // Symmetrical with the server's encoder-reader / ws-sender
+    // counters and the decoder's `stats()`.  `submitted` increments on
+    // every drawFrame() call (one per VideoDecoder output);
+    // `painted` increments only after a successful backend `draw()` —
+    // a gap between the two means frames are being coalesced (in
+    // rAF mode) or thrown away due to a draw error.
+    /** @private */ this._submitted    = 0;
+    /** @private */ this._painted      = 0;
+    /** @private */ this._coalesced    = 0;
+    /** @private */ this._drawErrors   = 0;
+    /** @private @type {string|null} */ this._lastDrawError = null;
 
     /** @private @type {WebGL2Backend|Canvas2DBackend} */
     this._backend = WebGL2Backend.tryCreate(canvas) || new Canvas2DBackend(canvas);
-    console.log(`Renderer backend: ${this._backend.name}`);
+    console.log(
+      `Renderer backend: ${this._backend.name}` +
+      (this._lowLatency ? ' (low-latency, sync paint)' : ' (rAF-coalesced)'),
+    );
+  }
+
+  /**
+   * Snapshot of the diagnostic counters for the periodic ticker in
+   * `main.js`.  Never throws.
+   * @returns {{submitted:number,painted:number,coalesced:number,errors:number,lastError:(string|null),backend:string,canvas:string}}
+   */
+  stats() {
+    return {
+      submitted: this._submitted,
+      painted: this._painted,
+      coalesced: this._coalesced,
+      errors: this._drawErrors,
+      lastError: this._lastDrawError,
+      backend: this._backend ? this._backend.name : 'none',
+      canvas: `${this._canvas.width}x${this._canvas.height}`,
+    };
   }
 
   /**
@@ -48,12 +101,22 @@ export class Renderer {
    * @param {VideoFrame} frame
    */
   drawFrame(frame) {
+    this._submitted++;
     // Drop the old pending frame to keep latency at minimum.
     if (this._pendingFrame) {
+      this._coalesced++;
       this._pendingFrame.close();
     }
     this._pendingFrame = frame;
     this._running = true;
+
+    if (this._lowLatency) {
+      // Paint immediately so the GPU draw call hits the compositor
+      // before the next vsync window starts.  This shaves up to one
+      // refresh of latency vs. the rAF path.
+      this._render();
+      return;
+    }
 
     // Schedule a single rAF only if one isn't already queued.  This keeps
     // the rAF callback dormant when no new frames arrive (e.g. the remote
@@ -77,7 +140,22 @@ export class Renderer {
       this._pendingFrame = null;
       try {
         this._backend.draw(frame);
+        this._painted++;
+        // Diagnostic: log the first two paints with the backend and
+        // canvas dimensions.  A silent gap between "VideoDecoder
+        // produced frame #N" and "Renderer painted frame #N" means the
+        // backend `draw()` is throwing or the canvas is hidden / 0×0.
+        if (this._painted <= 2) {
+          console.log(
+            `Renderer painted frame #${this._painted}: ` +
+            `backend=${this._backend.name}, ` +
+            `canvas=${this._canvas.width}x${this._canvas.height}, ` +
+            `frame=${frame.codedWidth}x${frame.codedHeight}`,
+          );
+        }
       } catch (e) {
+        this._drawErrors++;
+        this._lastDrawError = (e && e.message) ? e.message : String(e);
         console.warn('draw failed:', e);
         // If the WebGL2 backend dies for some reason (e.g. context lost
         // or a driver bug rejecting texImage2D from a VideoFrame on this
@@ -90,9 +168,10 @@ export class Renderer {
       }
       frame.close();
     }
-    // Re-arm rAF only if another frame arrived during the paint.  When
-    // the queue is empty we stay dormant until `drawFrame` is called.
-    if (this._running && this._pendingFrame) {
+    // Re-arm rAF only if another frame arrived during the paint AND
+    // we're in rAF-coalescing mode.  In low-latency mode `drawFrame`
+    // re-enters `_render` synchronously so no scheduling is needed.
+    if (!this._lowLatency && this._running && this._pendingFrame) {
       this._scheduleRender();
     }
   }
@@ -231,6 +310,13 @@ class WebGL2Backend {
     gl.disable(gl.BLEND);
 
     gl.viewport(0, 0, canvas.width, canvas.height);
+
+    // Last-known frame dimensions used to decide between `texImage2D`
+    // (re-allocates GPU storage) and `texSubImage2D` (writes into the
+    // existing storage).  Once the encoder settles on a resolution
+    // every subsequent frame hits the cheaper sub-image path.
+    this._texW = 0;
+    this._texH = 0;
   }
 
   resize(_w, _h) {
@@ -243,9 +329,27 @@ class WebGL2Backend {
     gl.bindTexture(gl.TEXTURE_2D, this._tex);
     // Zero-copy on Chrome/Edge: the VideoDecoder output surface is
     // uploaded straight to a GPU texture without going through CPU.
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame,
-    );
+    //
+    // We split the upload into "(re)allocate storage" and "write
+    // pixels" so that the steady-state path (frame dimensions stable)
+    // only does the latter.  `texImage2D` redefines the texture's
+    // mutable storage on every call, which forces the WebGL driver to
+    // re-validate format/size and may trigger an internal re-allocation
+    // even when the dimensions are unchanged; `texSubImage2D` skips
+    // both.  The Zero-Copy fast path applies equally to both calls.
+    const fw = frame.codedWidth || frame.displayWidth;
+    const fh = frame.codedHeight || frame.displayHeight;
+    if (fw !== this._texW || fh !== this._texH) {
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame,
+      );
+      this._texW = fw;
+      this._texH = fh;
+    } else {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, frame,
+      );
+    }
     gl.useProgram(this._program);
     gl.bindVertexArray(this._vao);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -259,6 +363,8 @@ class WebGL2Backend {
     this._tex = null;
     this._vao = null;
     this._program = null;
+    this._texW = 0;
+    this._texH = 0;
   }
 }
 

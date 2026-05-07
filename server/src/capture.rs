@@ -3,6 +3,27 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 /// Wraps the platform screen-capture API (DXGI on Windows).
+///
+/// ## Mouse cursor handling
+///
+/// On Windows, `scrap` builds on the DXGI Desktop Duplication API
+/// (`IDXGIOutputDuplication::AcquireNextFrame` + `MapDesktopSurface`,
+/// see `scrap-0.5.0/src/dxgi/mod.rs:111`).  Per the DXGI contract the
+/// returned desktop image **does not contain the hardware mouse
+/// cursor** — Windows composites the cursor at scan-out time, and the
+/// pointer shape is delivered out-of-band via `GetFramePointerShape`.
+///
+/// This means the encoder does not waste high-frequency bits redrawing
+/// the cursor on every frame (which is the optimization Sunshine /
+/// Parsec are known for), and the client-side overlay rendered at
+/// `#remote-cursor` from `MSG_CURSOR_INFO` updates is the single source
+/// of cursor pixels presented to the viewer.
+///
+/// Caveat: a small number of applications (notably some legacy games)
+/// draw their own software cursor into the framebuffer; those *will*
+/// appear in the captured frame.  Stripping them would require
+/// detecting and masking the software-cursor region — there is no
+/// general DXGI API for it.
 pub struct ScreenCapture {
     capturer: Capturer,
     width: u32,
@@ -90,8 +111,17 @@ impl ScreenCapture {
                     return Ok(&self.buf);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // No new frame yet – yield briefly to avoid busy-waiting.
-                    std::thread::sleep(Duration::from_millis(1));
+                    // No new frame yet – yield briefly to avoid
+                    // busy-waiting.  500 µs is short enough to be
+                    // invisible at any realistic FPS (1/60s ≈ 16.6 ms,
+                    // so this is < 4 % of a frame budget) and halves
+                    // the worst-case capture-side wakeup latency
+                    // compared to the previous 1 ms sleep.  scrap does
+                    // not expose DXGI's `AcquireNextFrame(timeout)`
+                    // blocking primitive — replacing scrap with a
+                    // direct DXGI binding to get true wait-on-update
+                    // semantics is tracked as a separate follow-up.
+                    std::thread::sleep(Duration::from_micros(500));
                 }
                 Err(e) => return Err(e.into()),
             }

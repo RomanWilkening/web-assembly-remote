@@ -1,18 +1,44 @@
 /**
- * WebCodecs-based H.264 decoder for ultra-low-latency video.
+ * Codec-aware low-latency video decoder built on the WebCodecs
+ * `VideoDecoder` API.
  *
- * Receives Annex-B access units and passes them directly to the
- * browser's hardware-accelerated VideoDecoder in Annex-B mode
- * (no avcC description). This is the most compatible approach
- * and avoids complex Annex-B → AVC conversion.
+ * Supports three input bitstream formats, selected by `setCodec()`
+ * before the first key frame arrives (`ServerInfo.codec` from the
+ * server's wire protocol):
+ *
+ *   * `0` – H.264 / AVC (Annex-B byte-stream, AUD-delimited)
+ *   * `1` – H.265 / HEVC (Annex-B byte-stream, AUD-delimited)
+ *   * `2` – AV1 (Low-Overhead Bitstream Format, raw OBU sequence)
+ *
+ * For all three formats the encoded chunks are passed through to the
+ * browser decoder verbatim — Chrome decodes Annex-B H.264/HEVC natively
+ * and accepts AV1 OBUs without an additional `description` payload, so
+ * we never have to do AVCC/HVCC/AV1C conversion in JavaScript.
+ *
+ * The codec-string for `VideoDecoder.configure()` is derived from the
+ * first key frame:
+ *
+ *   * H.264: parsed from SPS (profile_idc / constraint_set_flags /
+ *     level_idc) for an exact `avc1.PPCCLL` string.
+ *   * HEVC and AV1: a permissive default is used because parsing the
+ *     full VPS/SPS or the AV1 sequence header in JS would be a
+ *     significant amount of bit-stream code for a feature that, in
+ *     practice, just needs to advertise "Main profile up to 4K".
+ *     Production deployments that need a tighter codec string can wire
+ *     it up via a future `--client-codec-override` server flag (TODO).
  */
+
+// Wire-protocol codec IDs (must match `CodecKind::protocol_id` on the server).
+export const CODEC_H264 = 0;
+export const CODEC_HEVC = 1;
+export const CODEC_AV1  = 2;
 
 /**
  * @callback OnFrameCallback
  * @param {VideoFrame} frame
  */
 
-export class H264Decoder {
+export class VideoStreamDecoder {
   /** @param {OnFrameCallback} onFrame */
   constructor(onFrame) {
     /** @private */
@@ -29,6 +55,39 @@ export class H264Decoder {
     this._useSoftware = false;
     /** @private @type {number|null} – most recent measured one-way latency (ms) */
     this._latencyMs = null;
+    /** @private @type {number} – CODEC_* constant */
+    this._codecId = CODEC_H264;
+
+    // ── Diagnostic counters ─────────────────────────────────────
+    // Match the server-side `encoder-reader` / `ws-sender` counters so
+    // an operator can correlate frame flow end-to-end.  Each number is
+    // monotonic over the lifetime of this decoder instance; the
+    // periodic ticker in `main.js` reads them via `stats()`.
+    /** @private */ this._decodeIn        = 0; // chunks submitted to VideoDecoder
+    /** @private */ this._decodeOut       = 0; // VideoFrames produced (output cb)
+    /** @private */ this._droppedQueueFull = 0; // delta frames skipped due to deep queue
+    /** @private */ this._droppedNoConfig  = 0; // delta frames dropped while waiting for IDR
+    /** @private */ this._errors           = 0; // VideoDecoder errors observed
+    /** @private @type {string|null} */ this._lastError = null;
+  }
+
+  /**
+   * Snapshot of the diagnostic counters; called by the periodic ticker
+   * in `main.js`.  Never throws.
+   * @returns {{in:number,out:number,dropped:number,droppedNoCfg:number,errors:number,lastError:(string|null),queueSize:number,configured:boolean,state:string}}
+   */
+  stats() {
+    return {
+      in: this._decodeIn,
+      out: this._decodeOut,
+      dropped: this._droppedQueueFull,
+      droppedNoCfg: this._droppedNoConfig,
+      errors: this._errors,
+      lastError: this._lastError,
+      queueSize: this._decoder ? this._decoder.decodeQueueSize : 0,
+      configured: this._configured,
+      state: this._decoder ? this._decoder.state : 'none',
+    };
   }
 
   /**
@@ -44,32 +103,63 @@ export class H264Decoder {
   }
 
   /**
-   * Configure the decoder once the first key-frame arrives.
-   * SPS is extracted from the Annex-B data to build the codec
-   * string. No avcC description is provided – Chrome will decode
-   * the raw Annex-B data directly.
-   * @param {Uint8Array} annexB – complete key-frame access unit
+   * Tell the decoder which codec the encoder is producing.  Reset of
+   * the configuration happens automatically on the next key frame.
+   * @param {number} codecId – one of CODEC_H264 / CODEC_HEVC / CODEC_AV1
    */
-  _configureFromKeyFrame(annexB) {
-    const nalUnits = parseAnnexB(annexB);
+  setCodec(codecId) {
+    if (codecId !== CODEC_H264 && codecId !== CODEC_HEVC && codecId !== CODEC_AV1) {
+      console.warn(`Unknown codec ID ${codecId} – falling back to H.264`);
+      codecId = CODEC_H264;
+    }
+    if (codecId !== this._codecId) {
+      this._codecId = codecId;
+      // Force re-configuration on the next key frame.
+      if (this._decoder && this._decoder.state !== 'closed') {
+        try { this._decoder.close(); } catch (_) { /* ignore */ }
+      }
+      this._configured = false;
+      console.log(`Decoder codec set to ${codecName(codecId)}`);
+    }
+  }
 
-    let sps = null;
-    for (const nal of nalUnits) {
-      if (nal.length > 3 && (nal[0] & 0x1f) === 7) {
-        sps = nal;
+  /**
+   * Configure the decoder once the first key frame arrives.  The codec
+   * string is derived per-codec; see the file header comment for the
+   * rationale behind the HEVC / AV1 defaults.
+   * @param {Uint8Array} keyFrame – complete key-frame access unit
+   */
+  _configureFromKeyFrame(keyFrame) {
+    let codec;
+    switch (this._codecId) {
+      case CODEC_HEVC:
+        // hev1.<profile>.<profile_compatibility>.L<level×30>.<constraints>
+        // Profile 1 = Main, profile compatibility 6 = Main, level 5.1
+        // is encoded as `153` (HEVC convention: level × 30, so 5.1 → 153);
+        // covers up to 4K@60 which is also the upper bound of what
+        // desktop HW HEVC encoders emit.
+        codec = 'hev1.1.6.L153.B0';
+        break;
+      case CODEC_AV1:
+        // av01.<profile>.<level><tier>.<bit_depth>
+        // Profile 0 = Main, level 4.0 is encoded as the two-digit `08`
+        // (AV1 convention: 5.2 → 13, 4.0 → 8 → padded "08"), tier `M`
+        // = Main, 8-bit colour depth.  Covers 4K@30 / 1080p@120 —
+        // desktop streaming below 4K@60 fits comfortably; AMF and
+        // SVT-AV1 emit Main profile by default.
+        codec = 'av01.0.08M.08';
+        break;
+      case CODEC_H264:
+      default: {
+        const c = h264CodecStringFromKeyFrame(keyFrame);
+        if (!c) {
+          console.warn('H.264 key frame missing SPS – cannot configure decoder');
+          return;
+        }
+        codec = c;
         break;
       }
     }
-
-    if (!sps) {
-      console.warn('Key-frame missing SPS – cannot configure decoder');
-      return;
-    }
-
-    const profile = sps[1];
-    const compat = sps[2];
-    const level = sps[3];
-    const codec = `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
 
     // Close any previous decoder instance.
     if (this._decoder && this._decoder.state !== 'closed') {
@@ -77,8 +167,25 @@ export class H264Decoder {
     }
 
     this._decoder = new VideoDecoder({
-      output: (frame) => this._onFrame(frame),
+      output: (frame) => {
+        this._decodeOut++;
+        // Diagnostic: log the first two decoded frames so an operator
+        // can correlate "encoder-reader: emitted frame #N" / "ws-sender:
+        // shipped frame #N" / "MSG_VIDEO_FRAME #N received" with
+        // "VideoDecoder produced frame #N".  A silent gap here means
+        // WebCodecs accepted the chunks but produced no output (codec
+        // mismatch, hardware fallback, etc.).
+        if (this._decodeOut <= 2) {
+          console.log(
+            `VideoDecoder produced frame #${this._decodeOut}: ` +
+            `${frame.codedWidth}x${frame.codedHeight}, ts=${frame.timestamp}us`,
+          );
+        }
+        this._onFrame(frame);
+      },
       error: (e) => {
+        this._errors++;
+        this._lastError = (e && e.message) ? e.message : String(e);
         console.error('VideoDecoder error:', e);
         // Mark as unconfigured so the next key-frame triggers
         // re-initialisation instead of feeding a closed decoder.
@@ -116,14 +223,13 @@ export class H264Decoder {
   }
 
   /**
-   * Decode one H.264 access unit (Annex-B).
-   * The raw Annex-B data (with start codes and inline SPS/PPS)
-   * is passed directly to WebCodecs.
-   * @param {Uint8Array} annexB
+   * Decode one access unit.  The data is passed verbatim to WebCodecs
+   * — no Annex-B → AVCC / HVCC / AV1C conversion is performed.
+   * @param {Uint8Array} data – complete codec access unit
    * @param {boolean} isKeyFrame
    * @param {number} timestampUs – microsecond timestamp from server
    */
-  decode(annexB, isKeyFrame, timestampUs) {
+  decode(data, isKeyFrame, timestampUs) {
     // If the decoder was closed (e.g. after an error), reset and wait
     // for the next key-frame to reconfigure.
     if (this._decoder && this._decoder.state === 'closed') {
@@ -131,8 +237,11 @@ export class H264Decoder {
     }
 
     if (!this._configured) {
-      if (!isKeyFrame) return; // need a key-frame first
-      this._configureFromKeyFrame(annexB);
+      if (!isKeyFrame) {
+        this._droppedNoConfig++;
+        return; // need a key-frame first
+      }
+      this._configureFromKeyFrame(data);
       if (!this._configured) return;
     }
 
@@ -144,24 +253,25 @@ export class H264Decoder {
     // The threshold adapts to the current network RTT: a healthy 10 ms
     // link can absorb a small queue without adding visible lag, whereas
     // a 200 ms link should drop aggressively.  Caller updates RTT via
-    // `setRttMs()`; falls back to a conservative magic number of 3 if
-    // no RTT samples have been recorded yet.
+    // `setLatencyMs()`; falls back to a conservative magic number of 3
+    // if no RTT samples have been recorded yet.
     if (!isKeyFrame && this._decoder.decodeQueueSize > this._dropThreshold()) {
+      this._droppedQueueFull++;
       return;
     }
 
-    // Pass raw Annex-B data directly – no conversion needed.
-    // Chrome decodes Annex-B natively when no avcC description
-    // was provided during configure().
     const chunk = new EncodedVideoChunk({
       type: isKeyFrame ? 'key' : 'delta',
       timestamp: timestampUs, // µs
-      data: annexB,
+      data,
     });
 
     try {
       this._decoder.decode(chunk);
+      this._decodeIn++;
     } catch (e) {
+      this._errors++;
+      this._lastError = (e && e.message) ? e.message : String(e);
       console.error('decode() threw:', e);
       this._configured = false;
     }
@@ -209,8 +319,37 @@ export class H264Decoder {
   }
 }
 
+/**
+ * Backwards-compatible alias for callers that still import the old
+ * H.264-only class name.
+ * @deprecated Use `VideoStreamDecoder` and `setCodec()`.
+ */
+export const H264Decoder = VideoStreamDecoder;
+
 // ---------------------------------------------------------------------------
-// Annex-B parsing utilities
+// H.264 codec-string derivation
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an `avc1.PPCCLL` codec string from the SPS NAL unit found in
+ * an Annex-B key-frame access unit, or `null` if no SPS is present.
+ * @param {Uint8Array} keyFrame
+ * @returns {string|null}
+ */
+function h264CodecStringFromKeyFrame(keyFrame) {
+  const nals = parseAnnexB(keyFrame);
+  for (const nal of nals) {
+    if (nal.length > 3 && (nal[0] & 0x1f) === 7) {
+      // SPS: byte 0 is NAL header, bytes 1..3 are profile_idc /
+      // constraint flags / level_idc.
+      return `avc1.${hex(nal[1])}${hex(nal[2])}${hex(nal[3])}`;
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Annex-B parsing utilities (used by H.264 SPS extraction)
 // ---------------------------------------------------------------------------
 
 /**
@@ -269,4 +408,14 @@ function parseAnnexB(data) {
 /** @param {number} n @returns {string} */
 function hex(n) {
   return n.toString(16).padStart(2, '0');
+}
+
+/** @param {number} id @returns {string} */
+function codecName(id) {
+  switch (id) {
+    case CODEC_H264: return 'H.264';
+    case CODEC_HEVC: return 'HEVC';
+    case CODEC_AV1:  return 'AV1';
+    default:         return `Unknown(${id})`;
+  }
 }

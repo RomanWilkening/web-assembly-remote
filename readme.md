@@ -32,13 +32,23 @@ browser's WebCodecs API (also hardware-accelerated) and renders on a `<canvas>`.
 
 | Layer | Technique |
 |-------|-----------|
-| Capture | DXGI Desktop Duplication (GPU-resident, ~1 ms) |
-| Encoding | AMD AMF `ultralowlatency` preset, no B-frames, CQP rate control |
+| Capture | DXGI Desktop Duplication (GPU-resident, ~1 ms); 500 µs polling sleep when idle |
+| Encoding | AMF / NVENC / x264 / x265 / SVT-AV1 with `ultralowlatency` / `zerolatency` presets, no B-frames |
+| Rate control | CQP/CRF by default (constant quality) or CBR with a 1-frame VBV buffer (`--bitrate-kbps`) |
+| Slicing | Optional intra-frame slicing (`--slices N`) lets the decoder start work before the whole frame has arrived |
 | Framing | Minimal binary protocol (10-byte header per frame) |
-| Transport | WebSocket binary, TCP_NODELAY, channel buffer of 2 frames |
-| Decoding | WebCodecs `optimizeForLatency: true` (browser hardware decoder) |
-| Rendering | `desynchronized` canvas, newest-frame-only policy |
+| Transport | WebSocket binary, TCP_NODELAY, send-side newest-wins frame coalescing (delta frames are dropped under congestion; key frames never are) |
+| Decoding | WebCodecs `optimizeForLatency: true` (browser hardware decoder) for H.264 / HEVC / AV1 |
+| Rendering | WebGL2 zero-copy `texImage2D(VideoFrame)` upload, `desynchronized` canvas, immediate paint (no rAF gate) by default |
 | Input | Throttled at ~125 Hz, sent immediately over WebSocket |
+
+## Quality Knobs
+
+| Layer | Technique |
+|-------|-----------|
+| Codec | H.264 (universal), HEVC (better compression at the same QP), AV1 (best compression but newer HW only) |
+| Chroma | 4:2:0 (default, universal HW decode) or 4:4:4 (`--chroma 444`, sharper text/UI; HW-decoder support varies) |
+| Colour | BT.709 + full PC range tags emitted to FFmpeg for software encoders (`libx264` / `libx265` / `libsvtav1`). HW encoders (AMF / NVENC / QSV / VAAPI) write their own SPS VUI fields and the global `-color_*` flags are deliberately omitted to avoid an AMF-specific reconfigure stall observed on Windows 11 with AMD drivers. |
 
 ## Prerequisites
 
@@ -91,8 +101,12 @@ CLI flags:
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `9090` | Bind port |
 | `--fps` | `60` | Target frame rate |
-| `--quality` | `20` | H.264 QP value (lower = better quality, higher bitrate) |
-| `--encoder` | `h264_amf` | FFmpeg encoder name (`h264_amf`, `libx264`, …) |
+| `--quality` | `20` | Codec QP/CRF value (lower = better quality, higher bitrate). Ignored when `--bitrate-kbps` is set. |
+| `--encoder` | `h264_amf` | FFmpeg encoder name (`h264_amf` / `hevc_amf` / `av1_amf` for AMD, `h264_nvenc` / `hevc_nvenc` / `av1_nvenc` for NVIDIA, `libx264` / `libx265` / `libsvtav1` for CPU fallback). |
+| `--codec` | auto | Override codec family for splitting + browser decoder (`h264`, `hevc`, `av1`). Auto-detected from `--encoder` when omitted. |
+| `--chroma` | `420` | Chroma sub-sampling: `420` (universal HW decode, no explicit pixel-format conversion — FFmpeg auto-negotiates the BGRA → encoder-native path) or `444` (sharper text via `-pix_fmt yuv444p`, less HW decoder support). |
+| `--slices` | `1` | Number of slices per encoded frame. Higher values reduce decode latency at the cost of slightly worse compression. Honoured by H.264/HEVC encoders; ignored by AV1. The flag is only forwarded to FFmpeg when N > 1, so the default keeps the historical command line that older `h264_amf` builds were tuned against. |
+| `--bitrate-kbps` | _unset_ | Switch from constant-quality (CQP/CRF) to CBR with a 1-frame VBV buffer. Useful on bandwidth-limited links where stable glass-to-glass latency matters more than constant visual quality. |
 | `--static-dir` | `./static` | Path to client web files |
 | `--config` | `config.toml` | Path to TOML configuration file |
 
@@ -215,3 +229,7 @@ cd server
 - **Higher QP** (e.g. `--quality 28`) = lower bandwidth, more compression artifacts
 - **Reduce FPS** (e.g. `--fps 30`) to halve bandwidth for non-gaming use
 - For gaming, keep `--fps 60` and QP around 18–22
+- **Switch to HEVC or AV1** (`--encoder hevc_amf` / `--encoder av1_amf`) for ~30–50 % less bandwidth at the same visual quality, provided the browser has HW decoder support
+- **`--chroma 444`** preserves full chroma resolution — visibly sharper text/UI on subpixel-rendered fonts, but only available with codecs/profiles your decoder supports
+- **`--slices 4`** can shave a frame of decode latency at 4K by letting the decoder start work on the first slice before the rest of the frame arrives
+- **`--bitrate-kbps 25000`** switches the encoder to CBR with a tight 1-frame VBV buffer — preferable on links where bandwidth is the bottleneck, because constant quality (CQP) can produce multi-MB key frames that take a full RTT to deliver

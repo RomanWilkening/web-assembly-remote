@@ -70,10 +70,17 @@ pub enum ServerMessage {
         data: Vec<u8>,
     },
     /// Initial handshake: desktop resolution and target FPS.
+    ///
+    /// `codec` selects how the client configures its `VideoDecoder`:
+    /// `0` = H.264, `1` = HEVC, `2` = AV1.  Older clients that do not
+    /// know about the byte will treat the message as the historical
+    /// 6-byte payload and silently fall back to H.264, which matches the
+    /// historical default.
     ServerInfo {
         width: u16,
         height: u16,
         fps: u8,
+        codec: u8,
     },
     /// Cursor position update (server-side cursor).
     CursorInfo {
@@ -148,12 +155,13 @@ impl ServerMessage {
                 buf.extend_from_slice(data);
                 buf
             }
-            ServerMessage::ServerInfo { width, height, fps } => {
-                let mut buf = Vec::with_capacity(6);
+            ServerMessage::ServerInfo { width, height, fps, codec } => {
+                let mut buf = Vec::with_capacity(7);
                 buf.push(MSG_SERVER_INFO);
                 buf.extend_from_slice(&width.to_le_bytes());
                 buf.extend_from_slice(&height.to_le_bytes());
                 buf.push(*fps);
+                buf.push(*codec);
                 buf
             }
             ServerMessage::CursorInfo { x, y, visible } => {
@@ -296,7 +304,11 @@ impl ServerMessage {
                 let width = u16::from_le_bytes(data[1..3].try_into().ok()?);
                 let height = u16::from_le_bytes(data[3..5].try_into().ok()?);
                 let fps = data[5];
-                Some(ServerMessage::ServerInfo { width, height, fps })
+                // Codec byte was added in v2 of the protocol; for
+                // backwards compatibility default to H.264 (= 0) when
+                // the field is absent.
+                let codec = data.get(6).copied().unwrap_or(0);
+                Some(ServerMessage::ServerInfo { width, height, fps, codec })
             }
             MSG_CURSOR_INFO if data.len() >= 6 => {
                 let x = u16::from_le_bytes(data[1..3].try_into().ok()?);
@@ -417,14 +429,37 @@ mod tests {
 
     #[test]
     fn roundtrip_server_info() {
-        let msg = ServerMessage::ServerInfo { width: 1920, height: 1080, fps: 60 };
+        let msg = ServerMessage::ServerInfo { width: 1920, height: 1080, fps: 60, codec: 1 };
         let encoded = msg.encode();
         let decoded = ServerMessage::decode(&encoded).unwrap();
         match decoded {
-            ServerMessage::ServerInfo { width, height, fps } => {
+            ServerMessage::ServerInfo { width, height, fps, codec } => {
                 assert_eq!(width, 1920);
                 assert_eq!(height, 1080);
                 assert_eq!(fps, 60);
+                assert_eq!(codec, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Old clients (and old proxies that may strip trailing bytes)
+    /// must still be able to decode a 6-byte ServerInfo by treating the
+    /// missing codec byte as H.264.
+    #[test]
+    fn roundtrip_server_info_legacy_no_codec_byte() {
+        let mut bytes = vec![MSG_SERVER_INFO];
+        bytes.extend_from_slice(&1920u16.to_le_bytes());
+        bytes.extend_from_slice(&1080u16.to_le_bytes());
+        bytes.push(60);
+        // Note: no codec byte — legacy 6-byte payload.
+        let decoded = ServerMessage::decode(&bytes).unwrap();
+        match decoded {
+            ServerMessage::ServerInfo { width, height, fps, codec } => {
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+                assert_eq!(fps, 60);
+                assert_eq!(codec, 0, "legacy payload must default to H.264");
             }
             _ => panic!("wrong variant"),
         }
